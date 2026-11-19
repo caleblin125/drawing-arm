@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 160">
+  <!-- house + sun + wavy ground: exercises paths, arcs, curves, shapes, transforms -->
+  <g fill="none" stroke="black">
+    <path d="M40 120 V70 L80 35 L120 70 V120 Z"/>
+    <rect x="70" y="90" width="20" height="30"/>
+    <rect x="50" y="78" width="14" height="14"/>
+    <circle cx="160" cy="35" r="16"/>
+    <g transform="translate(160 35)">
+      <path d="M22 0 h10 M-22 0 h-10 M0 22 v10 M0 -22 v-10"/>
+      <path d="M16 16 l7 7 M-16 -16 l-7 -7 M16 -16 l7 -7 M-16 16 l-7 7"/>
+    </g>
+    <path d="M5 135 q15 -10 30 0 t30 0 t30 0 t30 0 t30 0 t30 0"/>
+    <path d="M140 120 a20 25 0 0 1 40 0"/>
+  </g>
+</svg>

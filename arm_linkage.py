@@ -1,466 +1,590 @@
 """
-arm_linkage.py - planar 3-joint drawing arm, all three inputs at the shoulder.
+arm_linkage.py - tkinter simulator for the planar 3-joint drawing arm.
 
-Layout (top view, XY plane, units = mm, angles = rad, CCW positive)
---------------------------------------------------------------------
-    S  shoulder pivot (fixed to body).  M1, M2, M3 are coaxial shafts here.
-    E  elbow,  W  wrist,  P  pen tip
+    python arm_linkage.py           GUI
+    python arm_linkage.py --test    numerical self-checks
 
-    Main chain:   S --L1-- E --L2-- W --L3-- P        (upper arm, forearm, hand)
-
-    Elbow drive  ("5-bar" with both inputs at S -> parallelogram):
-        M1 drives the upper arm directly.
-        M2 drives a crank S->C2 (radius r_e).  The forearm has a tail E->T2
-        (also r_e).  Coupler C2-T2 has length L1, so S-E-T2-C2 is a
-        parallelogram and the forearm's ABSOLUTE angle follows M2.
-
-    Wrist drive  (two parallelograms in series, with an idler bell-crank at E):
-        M3 drives crank S->A1 (r_a).  Coupler A1-A2 (length L1) turns a free
-        bell-crank at the elbow (arm E->A2 of r_a, arm E->B1 of r_b, the two
-        arms off_b-off_a apart).  Coupler B1-B2 (length L2) turns the hand crank
-        W->B2 (r_b), which is rigid with the hand.
-        => the hand's ABSOLUTE angle follows M3.
-
-    Consequence: inputs map straight to absolute link angles
-        M1 = phi1 (upper arm),  M2 = phi2 + pi (forearm),  M3 = phi3 + off_a (hand)
-    so IK is a plain 2-link solve plus a choice of hand angle, and FK is
-    fully decoupled (turning M1 alone translates forearm+hand without rotating
-    them).
-
-Dead points: a parallelogram is singular when its crank lines up with the
-link it rides on.  Transmission "margin" = |sin(crank - link)|, 1 = ideal.
-    elbow stage   : |sin(elbow bend)|        -> elbow bend kept in 20..160 deg
-    wrist stage A : |sin(phi3+off_a - phi1)|
-    wrist stage B : |sin(phi3+off_b - phi2)|
-Making the elbow bell-crank an L (off_b - off_a = 90 deg) lets both wrist
-stages be perfect at a 90 deg elbow bend and stay >= ~0.8 over the range.
-The 3rd DOF (hand angle) is redundant for 2D pen position, so the IK uses it
-to maximise the worst margin.
-
-Run:  python arm_linkage.py          (GUI)
-      python arm_linkage.py --test   (IK->FK consistency check)
+Modules
+    arm_kinematics.py   geometry, human range-of-motion profiles, FK/IK, dynamics
+    path_planner.py     stroke ordering, human-like timing, min-energy redundancy DP
+    vector_input.py     SVG / raster image -> strokes
 """
 import math
-import random
 import sys
-from dataclasses import dataclass
+import threading
+import time
 
-TAU = 2 * math.pi
-D = math.radians
+import numpy as np
 
+from arm_kinematics import (D, DEFAULT_ROM, ROM_PROFILES, Geometry, Linkage,
+                            dist, inverse_dynamics, kinetic_energy, mass_params,
+                            reachable_grid, solve_ik, wrap)
+from path_planner import PlanParams, export_csv, plan_job
+from vector_input import fit_to_box, load_image, load_svg
 
-# ----------------------------------------------------------------- geometry
-@dataclass
-class Geometry:
-    L1: float = 300.0          # upper arm   (shoulder -> elbow)
-    L2: float = 250.0          # forearm     (elbow -> wrist)
-    L3: float = 70.0           # hand        (wrist -> pen tip)
-    r_e: float = 60.0          # elbow drive crank at S  = forearm tail at E
-    r_a: float = 45.0          # wrist crank at S        = bell-crank arm A at E
-    r_b: float = 40.0          # bell-crank arm B at E   = hand crank at W
-    off_a: float = 0.0         # crank A angle relative to hand direction
-    off_b: float = D(90)       # crank B angle relative to hand direction
-    elbow_sign: int = +1       # +1: elbow bends CCW (forearm left of upper arm)
-    elbow_min: float = D(20)   # |elbow bend| limits (parallelogram dead points at 0/180)
-    elbow_max: float = D(160)
-    wrist_max: float = D(100)  # |hand - forearm| limit (human-ish)
-    margin_min: float = 0.30   # reject IK solutions with worse transmission
+PAPER = (250.0, -110.0, 510.0, 110.0)          # x0, y0, x1, y1 (mm)
 
 
-# ---------------------------------------------------------------- 2D helpers
-def polar(p, r, a):
-    return (p[0] + r * math.cos(a), p[1] + r * math.sin(a))
+# ------------------------------------------------------------ built-in shapes
+def builtin_shape(name):
+    """Strokes in a 0..200 box, y down (same convention as SVG/images)."""
+    c = np.array([100.0, 100.0])
+    t = np.linspace(0, 2 * math.pi, 241)
+    if name == "circle":
+        return [c + 90 * np.stack([np.cos(t), np.sin(t)], 1)]
+    if name == "star":
+        k = np.arange(11)
+        r = np.where(k % 2 == 0, 95, 38)
+        a = -math.pi / 2 + k * math.pi / 5
+        return [c + np.stack([r * np.cos(a), r * np.sin(a)], 1)]
+    if name == "spiral":
+        tt = np.linspace(0, 6 * math.pi, 600)
+        r = 4 + 4.5 * tt
+        return [c + np.stack([r * np.cos(tt), r * np.sin(tt)], 1)]
+    if name == "heart":
+        x = 16 * np.sin(t) ** 3
+        y = -(13 * np.cos(t) - 5 * np.cos(2 * t) - 2 * np.cos(3 * t) - np.cos(4 * t))
+        return [c + 5.5 * np.stack([x, y], 1)]
+    if name == "lissajous":
+        tt = np.linspace(0, 2 * math.pi, 800)
+        return [c + np.stack([95 * np.sin(3 * tt), 80 * np.sin(4 * tt)], 1)]
+    if name == "flower":
+        r = 50 + 40 * np.cos(5 * t)
+        return [c + np.stack([r * np.cos(t), r * np.sin(t)], 1)]
+    if name == "grid":
+        s = []
+        for v in range(10, 191, 30):
+            s += [np.array([[v, 10.0], [v, 190.0]]), np.array([[10.0, v], [190.0, v]])]
+        return s
+    raise KeyError(name)
 
 
-def ang(p, q):
-    return math.atan2(q[1] - p[1], q[0] - p[0])
+SHAPES = ["circle", "star", "spiral", "heart", "lissajous", "flower", "grid"]
 
 
-def wrap(a):
-    return (a + math.pi) % TAU - math.pi
-
-
-def dist(p, q):
-    return math.hypot(q[0] - p[0], q[1] - p[1])
-
-
-def circle_x(c0, r0, c1, r1):
-    """Intersections of two circles (0, 1 or 2 points)."""
-    dx, dy = c1[0] - c0[0], c1[1] - c0[1]
-    d = math.hypot(dx, dy)
-    if d < 1e-12 or d > r0 + r1 + 1e-9 or d < abs(r0 - r1) - 1e-9:
-        return []
-    a = (r0 * r0 - r1 * r1 + d * d) / (2 * d)
-    h = math.sqrt(max(r0 * r0 - a * a, 0.0))
-    mx, my = c0[0] + a * dx / d, c0[1] + a * dy / d
-    return [(mx - h * dy / d, my + h * dx / d), (mx + h * dy / d, my - h * dx / d)]
-
-
-def nearest(pts, ref):
-    return min(pts, key=lambda p: dist(p, ref))
-
-
-# ------------------------------------------------------------------- margins
-def margins(g, phi1, phi2, phi3):
-    return (abs(math.sin(phi2 - phi1)),                 # elbow parallelogram
-            abs(math.sin(phi3 + g.off_a - phi1)),       # wrist stage A (upper arm)
-            abs(math.sin(phi3 + g.off_b - phi2)))       # wrist stage B (forearm)
-
-
-# ------------------------------------------------------------- forward kin.
-class Linkage:
-    """Solves the closed loops from the three input angles by circle
-    intersection (works even if couplers aren't exact parallelograms).
-    Branch choice: nearest to the previous solution if track=True (what a real
-    mechanism does - it can flip at a dead point), otherwise nearest to the
-    ideal parallelogram position."""
-
-    def __init__(self, g):
-        self.g = g
-        self.prev = None
-
-    def solve(self, m1, m2, m3, track=False):
-        g = self.g
-        pv = self.prev if track else None
-        S = (0.0, 0.0)
-        E = polar(S, g.L1, m1)
-
-        # elbow parallelogram  S-E-T2-C2
-        C2 = polar(S, g.r_e, m2)
-        sols = circle_x(C2, g.L1, E, g.r_e)
-        if not sols:
-            return None
-        T2 = nearest(sols, pv["T2"] if pv else polar(E, g.r_e, m2))
-        phi2 = ang(E, T2) - math.pi
-        W = polar(E, g.L2, phi2)
-
-        # wrist stage A  S-E-A2-A1
-        A1 = polar(S, g.r_a, m3)
-        sols = circle_x(A1, g.L1, E, g.r_a)
-        if not sols:
-            return None
-        A2 = nearest(sols, pv["A2"] if pv else polar(E, g.r_a, m3))
-        bell = ang(E, A2)                            # bell-crank arm A angle
-        B1 = polar(E, g.r_b, bell - g.off_a + g.off_b)
-
-        # wrist stage B  E-W-B2-B1
-        sols = circle_x(B1, g.L2, W, g.r_b)
-        if not sols:
-            return None
-        bB = bell - g.off_a + g.off_b
-        B2 = nearest(sols, pv["B2"] if pv else polar(W, g.r_b, bB))
-        phi3 = ang(W, B2) - g.off_b
-        P = polar(W, g.L3, phi3)
-
-        phi1 = m1
-        st = dict(S=S, E=E, W=W, P=P, C2=C2, T2=T2, A1=A1, A2=A2, B1=B1, B2=B2,
-                  phi1=phi1, phi2=phi2, phi3=phi3, inputs=(m1, m2, m3),
-                  margins=margins(g, phi1, phi2, phi3))
-        # flipped into an anti-parallelogram?
-        st["flipped"] = (abs(wrap(phi2 + math.pi - m2)) > 1e-3 or
-                         abs(wrap(phi3 + g.off_a - m3)) > 1e-3)
-        self.prev = st
-        return st
-
-
-# ------------------------------------------------------------- inverse kin.
-def ik_2link(g, Wp):
-    """Shoulder/elbow angles that put the wrist at Wp (fixed elbow branch)."""
-    d2 = Wp[0] ** 2 + Wp[1] ** 2
-    c = (d2 - g.L1 ** 2 - g.L2 ** 2) / (2 * g.L1 * g.L2)
-    if abs(c) > 1:
-        return None
-    e = g.elbow_sign * math.acos(c)                  # relative elbow bend
-    if not (g.elbow_min <= abs(e) <= g.elbow_max):
-        return None
-    phi1 = math.atan2(Wp[1], Wp[0]) - math.atan2(g.L2 * math.sin(e), g.L1 + g.L2 * math.cos(e))
-    return phi1, phi1 + e
-
-
-def solve_ik(g, P, prev_phi3=None, fixed_phi3=None, smooth=0.15):
-    """Pen tip P -> input angles.  The hand angle (redundant DOF) is either
-    fixed, or chosen to maximise the worst transmission margin, with a
-    penalty on jumping away from the previous hand angle."""
-    if fixed_phi3 is not None:
-        cands = [fixed_phi3]
-    elif prev_phi3 is None:
-        cands = [D(k) for k in range(-180, 180)]
-    else:
-        cands = [prev_phi3 + D(0.5 * k) for k in range(-60, 61)]
-
-    best, best_cost = None, float("inf")
-    for phi3 in cands:
-        arm = ik_2link(g, polar(P, -g.L3, phi3))
-        if arm is None:
-            continue
-        phi1, phi2 = arm
-        if abs(wrap(phi3 - phi2)) > g.wrist_max:
-            continue
-        m = margins(g, phi1, phi2, phi3)
-        if min(m) < g.margin_min and fixed_phi3 is None:
-            continue
-        cost = -min(m)
-        if prev_phi3 is not None:
-            cost += smooth * abs(wrap(phi3 - prev_phi3))
-        if cost < best_cost:
-            best_cost, best = cost, (phi1, phi2, phi3, m)
-
-    if best is None:
-        if prev_phi3 is not None and fixed_phi3 is None:   # local search failed
-            return solve_ik(g, P, None, None, smooth)
-        return None
-    phi1, phi2, phi3, m = best
-    return dict(phi1=phi1, phi2=phi2, phi3=phi3, margins=m,
-                inputs=(phi1, phi2 + math.pi, phi3 + g.off_a))
-
-
-# --------------------------------------------------------------- self-test
-def self_test(n=5000):
+# ================================================================ self-test
+def self_test():
+    ok = True
     g = Geometry()
     lk = Linkage(g)
-    worst, solved = 0.0, 0
+    rng = np.random.default_rng(0)
+
+    worst, solved, n = 0.0, 0, 3000
     for _ in range(n):
-        P = (random.uniform(250, 510), random.uniform(-110, 110))
-        sol = solve_ik(g, P)
-        if not sol:
-            continue
-        solved += 1
-        st = lk.solve(*sol["inputs"])
-        worst = max(worst, dist(st["P"], P))
-    print(f"IK solved {solved}/{n} points on the paper; max |FK(IK(P)) - P| = {worst:.2e} mm")
+        P = (rng.uniform(PAPER[0], PAPER[2]), rng.uniform(PAPER[1], PAPER[3]))
+        s = solve_ik(g, P)
+        if s:
+            solved += 1
+            worst = max(worst, dist(lk.solve(*s["inputs"])["P"], P))
+    print(f"[IK/FK] solved {solved}/{n}, max |FK(IK(P)) - P| = {worst:.1e} mm")
+    ok &= solved == n and worst < 1e-6
 
-    # decoupling: rotating M1 alone must not rotate forearm or hand
-    s0 = lk.solve(D(10), D(200), D(30))
-    s1 = lk.solve(D(40), D(200), D(30))
-    print(f"M1 +30 deg -> forearm rotates {math.degrees(wrap(s1['phi2']-s0['phi2'])):.2e} deg, "
-          f"hand rotates {math.degrees(wrap(s1['phi3']-s0['phi3'])):.2e} deg")
+    s0, s1 = lk.solve(D(-40), D(230), D(40)), lk.solve(D(-10), D(230), D(40))
+    print(f"[decoupling] M1 +30 deg -> forearm {math.degrees(wrap(s1['phi2'] - s0['phi2'])):.1e} deg, "
+          f"hand {math.degrees(wrap(s1['phi3'] - s0['phi3'])):.1e} deg")
 
-    # worst margin over the paper with auto hand angle
-    mins = []
-    for x in range(250, 511, 10):
-        for y in range(-110, 111, 10):
-            s = solve_ik(g, (x, y))
-            if s:
-                mins.append(min(s["margins"]))
-    print(f"paper grid: worst transmission margin {min(mins):.2f}, mean {sum(mins)/len(mins):.2f}")
-    return worst < 1e-6 and solved == n
+    for name, rom in ROM_PROFILES.items():
+        _, _, r = reachable_grid(Geometry(rom=rom), *PAPER[::2], *PAPER[1::2], 10)
+        print(f"[ROM] {name:40s} paper reachable {100 * r.mean():5.1f}%")
+        ok &= r.all()
+
+    H = mass_params(g)
+    t = np.linspace(0, 2, 20001)
+    dt = t[1] - t[0]
+    q = np.stack([0.5 * np.sin(3 * t), 1 + 0.8 * np.sin(2 * t + 1), 0.3 * np.cos(5 * t)], 1)
+    qd = np.gradient(q, dt, axis=0)
+    qdd = np.gradient(qd, dt, axis=0)
+    tau = inverse_dynamics(H, q, qd, qdd)
+    err = np.abs(np.gradient(kinetic_energy(H, q, qd), dt) - (tau * qd).sum(1))[5:-5].max()
+    print(f"[dynamics] |dKE/dt - sum(tau*w)| = {err:.1e} W")
+    ok &= err < 1e-5
+
+    strokes = fit_to_box(builtin_shape("flower") + builtin_shape("grid"), PAPER)
+    res = {}
+    for m in ("greedy", "dp"):
+        t0 = time.time()
+        res[m] = plan_job(g, strokes, (380, 0), method=m)
+        st = res[m].stats
+        print(f"[plan:{m:6s}] {time.time() - t0:4.1f}s compute, {st['duration_s']:.1f}s job, "
+              f"int(qd'Mqd)={st['kinetic_integral']:.4f}, |work|={sum(st['abs_work_J']):.3f} J, "
+              f"peak tau={np.round(st['peak_torque_Nm'], 3)} Nm, unreachable={st['unreachable']}")
+    save = 1 - res["dp"].stats["kinetic_integral"] / res["greedy"].stats["kinetic_integral"]
+    print(f"[plan] min-energy DP saves {100 * save:.0f}% kinetic effort vs greedy IK")
+    ok &= res["dp"].stats["unreachable"] == 0
+    print("PASS" if ok else "FAIL")
+    return ok
 
 
 # ===================================================================== GUI
 def run_gui():
     import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    from PIL import Image, ImageTk
+
+    if sys.platform == "win32":                 # crisp rendering + correct sizes on HiDPI
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
 
     BLUE, GREEN, ORANGE = "#2f6db5", "#2f9e57", "#e08a1e"
     TEAL, PURPLE, GREY = "#1aa3a3", "#8e55c9", "#9aa0a6"
-    PAPER = (250, -110, 510, 110)                  # x0, y0, x1, y1 in mm
-
-    def resample(pts, step=2.0):
-        out = [pts[0]]
-        for a, b in zip(pts, pts[1:]):
-            n = max(1, int(dist(a, b) / step))
-            out += [(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n) for k in range(1, n + 1)]
-        return out
-
-    def shape(name):
-        cx, cy = (PAPER[0] + PAPER[2]) / 2, (PAPER[1] + PAPER[3]) / 2
-        strokes = []
-        if name == "circle":
-            strokes = [[(cx + 85 * math.cos(t * TAU / 200), cy + 85 * math.sin(t * TAU / 200)) for t in range(201)]]
-        elif name == "square":
-            s = 80
-            strokes = [[(cx - s, cy - s), (cx + s, cy - s), (cx + s, cy + s), (cx - s, cy + s), (cx - s, cy - s)]]
-        elif name == "star":
-            pts = []
-            for k in range(11):
-                r = 100 if k % 2 == 0 else 40
-                a = math.pi / 2 + k * math.pi / 5
-                pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-            strokes = [pts]
-        elif name == "spiral":
-            strokes = [[(cx + (5 + 3.2 * t / 10) * math.cos(t / 10), cy + (5 + 3.2 * t / 10) * math.sin(t / 10))
-                        for t in range(0, 290)]]
-        elif name == "heart":
-            pts = []
-            for k in range(201):
-                t = k * TAU / 200
-                x = 16 * math.sin(t) ** 3
-                y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
-                pts.append((cx + 5.5 * x, cy + 5.5 * y + 10))
-            strokes = [pts]
-        elif name == "lissajous":
-            strokes = [[(cx + 110 * math.sin(3 * t * TAU / 600), cy + 95 * math.sin(4 * t * TAU / 600))
-                        for t in range(601)]]
-        elif name == "grid":
-            for x in range(PAPER[0] + 10, PAPER[2], 40):
-                strokes.append([(x, PAPER[1] + 10), (x, PAPER[3] - 10)])
-            for y in range(PAPER[1] + 10, PAPER[3], 40):
-                strokes.append([(PAPER[0] + 10, y), (PAPER[2] - 10, y)])
-        return strokes
+    MOTOR_COLS = (BLUE, TEAL, PURPLE)
 
     class App:
         def __init__(self, root):
             self.root = root
-            root.title("3-joint drawing arm - planar linkage")
+            root.title("3-joint drawing arm")
             self.g = Geometry()
+            self.params = PlanParams()
             self.link = Linkage(self.g)
-            self.s = 0.95                           # px per mm
-            self.ox, self.oy = 170, 360
-            self.queue = []
-            self.mouse_down = False
-            self.target = ((PAPER[0] + PAPER[2]) / 2, 0.0)
+            sh = root.winfo_screenheight()
+            ch = max(420, min(720, sh - 170))
+            cw = int(ch * 1.12)
+            self.s = ch / 760.0
+            self.ox, self.oy = 180 * self.s, ch / 2
+            self.target = (380.0, 0.0)
             self.prev_phi3 = None
+            self.mouse_down = False
             self.last_pen = None
-            self.pen = False
             self.unreachable = False
+            self.plan = None
+            self.play_t = 0.0
+            self.playing = False
+            self.last_idx = 0
+            self.strokes_src = None
+            self.busy = False
+            self.cur_idx = None
+            self.pen = False
 
-            self.cv = tk.Canvas(root, width=840, height=720, bg="white", highlightthickness=0)
-            self.cv.grid(row=0, column=0, rowspan=2)
-            side = tk.Frame(root, padx=8, pady=8)
+            self.cv = tk.Canvas(root, width=cw, height=ch, bg="white", highlightthickness=0)
+            self.cv.grid(row=0, column=0, rowspan=2, sticky="nsew")
+            root.columnconfigure(0, weight=1)
+            root.rowconfigure(0, weight=1)
+            self.cv.bind("<Configure>", self.on_resize)
+            side = tk.Frame(root, padx=6, pady=6)
             side.grid(row=0, column=1, sticky="n")
-
-            self.mode = tk.StringVar(value="ik")
-            tk.Label(side, text="Mode", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-            tk.Radiobutton(side, text="IK: drag mouse / play shapes", variable=self.mode, value="ik",
-                           command=self.on_mode).pack(anchor="w")
-            tk.Radiobutton(side, text="Manual: drive the 3 input shafts", variable=self.mode, value="fk",
-                           command=self.on_mode).pack(anchor="w")
-
-            tk.Label(side, text="Hand angle (redundant DOF)", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 0))
-            self.hand_mode = tk.StringVar(value="auto")
-            tk.Radiobutton(side, text="auto: best transmission", variable=self.hand_mode, value="auto").pack(anchor="w")
-            tk.Radiobutton(side, text="fixed absolute angle:", variable=self.hand_mode, value="fixed").pack(anchor="w")
-            self.hand_deg = tk.DoubleVar(value=20)
-            tk.Scale(side, from_=-180, to=180, orient="horizontal", length=260, variable=self.hand_deg).pack(anchor="w")
-
-            tk.Label(side, text="Shapes", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 0))
-            bf = tk.Frame(side)
-            bf.pack(anchor="w")
-            for i, name in enumerate(["circle", "square", "star", "spiral", "heart", "lissajous", "grid"]):
-                tk.Button(bf, text=name, width=9, command=lambda n=name: self.play(n)).grid(row=i // 3, column=i % 3, padx=1, pady=1)
-            cf = tk.Frame(side)
-            cf.pack(anchor="w", pady=4)
-            tk.Button(cf, text="Stop", width=9, command=lambda: self.queue.clear()).pack(side="left", padx=1)
-            tk.Button(cf, text="Clear ink", width=9, command=lambda: self.cv.delete("ink")).pack(side="left", padx=1)
-            self.speed = tk.DoubleVar(value=150)
-            tk.Label(side, text="Pen speed (mm/s)").pack(anchor="w")
-            tk.Scale(side, from_=20, to=600, orient="horizontal", length=260, variable=self.speed).pack(anchor="w")
-
-            tk.Label(side, text="Input shafts (manual mode), deg", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 0))
-            self.mvars = []
-            for lbl, col in (("M1 shoulder", BLUE), ("M2 elbow drive", TEAL), ("M3 wrist drive", PURPLE)):
-                v = tk.DoubleVar()
-                tk.Scale(side, label=lbl, fg=col, from_=-180, to=360, resolution=0.5, orient="horizontal",
-                         length=260, variable=v).pack(anchor="w")
-                self.mvars.append(v)
-            self.pen_var = tk.BooleanVar(value=False)
-            tk.Checkbutton(side, text="pen down (manual mode)", variable=self.pen_var).pack(anchor="w")
-
+            nb = ttk.Notebook(side)
+            nb.pack(fill="x")
+            self.build_draw_tab(nb)
+            self.build_arm_tab(nb)
+            self.build_manual_tab(nb)
+            self.build_stats_tab(nb)
             self.info = tk.Label(side, justify="left", font=("Consolas", 9), anchor="w")
-            self.info.pack(anchor="w", pady=(8, 0))
+            self.info.pack(anchor="w", pady=(8, 0), fill="x")
 
             self.cv.bind("<ButtonPress-1>", self.on_press)
-            self.cv.bind("<B1-Motion>", self.on_drag)
-            self.cv.bind("<Motion>", self.on_hover)
+            self.cv.bind("<B1-Motion>", self.on_move)
+            self.cv.bind("<Motion>", self.on_move)
             self.cv.bind("<ButtonRelease-1>", lambda e: setattr(self, "mouse_down", False))
 
             self.draw_static()
             self.tick()
 
-        # ---- coordinate transforms
+        # ------------------------------------------------------------ tabs
+        def build_draw_tab(self, nb):
+            f = tk.Frame(nb, padx=6, pady=6)
+            nb.add(f, text="Draw")
+            self.mode = tk.StringVar(value="live")
+            for txt, val in (("live: arm follows mouse (hold = ink)", "live"),
+                             ("planned job playback", "plan"),
+                             ("manual: drive the 3 shafts", "manual")):
+                tk.Radiobutton(f, text=txt, variable=self.mode, value=val, command=self.on_mode).pack(anchor="w")
+
+            tk.Label(f, text="Built-in shapes", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 0))
+            bf = tk.Frame(f)
+            bf.pack(anchor="w")
+            for i, n in enumerate(SHAPES):
+                tk.Button(bf, text=n, width=8, command=lambda n=n: self.load_strokes(builtin_shape(n), n)
+                          ).grid(row=i // 4, column=i % 4, padx=1, pady=1)
+
+            tk.Label(f, text="Files", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 0))
+            ff = tk.Frame(f)
+            ff.pack(anchor="w")
+            tk.Button(ff, text="Load SVG...", width=12, command=self.open_svg).pack(side="left", padx=1)
+            tk.Button(ff, text="Load image...", width=12, command=self.open_image).pack(side="left", padx=1)
+            im = tk.Frame(f)
+            im.pack(anchor="w")
+            tk.Label(im, text="image →").pack(side="left")
+            self.img_mode = tk.StringVar(value="outline")
+            for v in ("outline", "hatch", "both"):
+                tk.Radiobutton(im, text=v, variable=self.img_mode, value=v).pack(side="left")
+            self.hatch = tk.DoubleVar(value=3.0)
+            tk.Scale(f, label="hatch spacing (px)", from_=1.5, to=8, resolution=0.5,
+                     orient="horizontal", length=250, variable=self.hatch).pack(anchor="w")
+
+            tk.Label(f, text="Playback", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 0))
+            pf = tk.Frame(f)
+            pf.pack(anchor="w")
+            tk.Button(pf, text="▶ / ❚❚", width=7, command=self.toggle_play).pack(side="left", padx=1)
+            tk.Button(pf, text="⟲ restart", width=8, command=self.restart).pack(side="left", padx=1)
+            tk.Button(pf, text="Clear ink", width=8, command=lambda: self.cv.delete("ink")).pack(side="left", padx=1)
+            self.mult = tk.DoubleVar(value=1.0)
+            tk.Scale(f, label="time scale (× real time)", from_=0.25, to=20, resolution=0.25,
+                     orient="horizontal", length=250, variable=self.mult).pack(anchor="w")
+            self.prog = ttk.Progressbar(f, length=250, maximum=1000)
+            self.prog.pack(anchor="w")
+            self.status = tk.Label(f, text="", fg="#555", anchor="w", justify="left", wraplength=290)
+            self.status.pack(anchor="w", fill="x")
+
+        def build_arm_tab(self, nb):
+            f = tk.Frame(nb, padx=6, pady=6)
+            nb.add(f, text="Arm")
+            tk.Label(f, text="Range-of-motion profile", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+            self.rom_name = tk.StringVar(value=DEFAULT_ROM)
+            ttk.Combobox(f, textvariable=self.rom_name, values=list(ROM_PROFILES), state="readonly",
+                         width=40).pack(anchor="w")
+            self.rom_name.trace_add("write", lambda *a: self.on_rom())
+            self.show_reach = tk.BooleanVar(value=True)
+            tk.Checkbutton(f, text="shade reachable pen area", variable=self.show_reach,
+                           command=self.draw_reach).pack(anchor="w")
+
+            tk.Label(f, text="Planner", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 0))
+            self.w_comfort = tk.DoubleVar(value=self.params.w_comfort)
+            tk.Scale(f, label="comfort weight (vs kinetic energy)", from_=0, to=0.5, resolution=0.01,
+                     orient="horizontal", length=250, variable=self.w_comfort).pack(anchor="w")
+            self.gain = tk.DoubleVar(value=self.params.power_gain)
+            tk.Scale(f, label="drawing speed gain k  (v = k·R^⅓)", from_=8, to=80, resolution=1,
+                     orient="horizontal", length=250, variable=self.gain).pack(anchor="w")
+            self.vmax = tk.DoubleVar(value=self.params.v_max)
+            tk.Scale(f, label="max pen-down speed (mm/s)", from_=40, to=600, resolution=10,
+                     orient="horizontal", length=250, variable=self.vmax).pack(anchor="w")
+            tk.Button(f, text="Re-plan current drawing", command=self.replan).pack(anchor="w", pady=2)
+
+            tk.Label(f, text="Live mode hand angle", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 0))
+            self.hand_mode = tk.StringVar(value="auto")
+            hf = tk.Frame(f)
+            hf.pack(anchor="w")
+            tk.Radiobutton(hf, text="auto (comfort)", variable=self.hand_mode, value="auto").pack(side="left")
+            tk.Radiobutton(hf, text="fixed:", variable=self.hand_mode, value="fixed").pack(side="left")
+            self.hand_deg = tk.DoubleVar(value=20)
+            tk.Scale(f, from_=-180, to=180, orient="horizontal", length=250, variable=self.hand_deg).pack(anchor="w")
+
+        def build_manual_tab(self, nb):
+            f = tk.Frame(nb, padx=6, pady=6)
+            nb.add(f, text="Manual")
+            tk.Label(f, text="Manual shafts (deg) - select 'manual' mode", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+            self.mvars = []
+            for lbl, col in (("M1 shoulder", BLUE), ("M2 elbow drive", TEAL), ("M3 wrist drive", PURPLE)):
+                v = tk.DoubleVar()
+                tk.Scale(f, label=lbl, fg=col, from_=-180, to=360, resolution=0.5, orient="horizontal",
+                         length=250, variable=v).pack(anchor="w")
+                self.mvars.append(v)
+            self.pen_var = tk.BooleanVar(value=False)
+            tk.Checkbutton(f, text="pen down", variable=self.pen_var).pack(anchor="w")
+
+        def build_stats_tab(self, nb):
+            f = tk.Frame(nb, padx=6, pady=6)
+            nb.add(f, text="Motors")
+            self.stats_lbl = tk.Label(f, text="(plan a drawing first)", justify="left",
+                                      font=("Consolas", 9), anchor="w")
+            self.stats_lbl.pack(anchor="w")
+            bf = tk.Frame(f)
+            bf.pack(anchor="w", pady=4)
+            tk.Button(bf, text="Motor plots", command=self.show_plots).pack(side="left", padx=1)
+            tk.Button(bf, text="Export CSV...", command=self.export).pack(side="left", padx=1)
+            tk.Button(bf, text="Compare vs greedy IK", command=self.compare).pack(side="left", padx=1)
+
+        # ------------------------------------------------------- transforms
         def w2c(self, p):
             return self.ox + self.s * p[0], self.oy - self.s * p[1]
 
         def c2w(self, x, y):
             return (x - self.ox) / self.s, (self.oy - y) / self.s
 
-        # ---- events
+        # ----------------------------------------------------------- events
+        def on_resize(self, e):
+            s_new = min(e.width / 840.0, e.height / 760.0)
+            ox_new, oy_new = 180 * s_new, e.height / 2
+            if abs(s_new - self.s) < 1e-6 and abs(oy_new - self.oy) < 0.5:
+                return
+            k = s_new / self.s
+            for tag in ("ink", "preview"):
+                self.cv.scale(tag, self.ox, self.oy, k, k)
+                self.cv.move(tag, ox_new - self.ox, oy_new - self.oy)
+            self.s, self.ox, self.oy = s_new, ox_new, oy_new
+            self.cv.delete("paper")
+            self.draw_static()
+            self.cv.tag_lower("preview")
+            self.cv.tag_lower("reach")
+            self.cv.tag_lower("paper")
+
         def on_mode(self):
-            if self.mode.get() == "fk" and self.link.prev:
+            if self.mode.get() == "manual" and self.link.prev:
                 for v, a in zip(self.mvars, self.link.prev["inputs"]):
-                    v.set(round(math.degrees(a) % 360 if math.degrees(a) < -180 else math.degrees(a), 1))
-            self.queue.clear()
+                    d = math.degrees(a)
+                    v.set(round(d + 360 if d < -180 else d, 1))
+            if self.mode.get() != "plan":
+                self.playing = False
+            self.last_pen = None
 
         def on_press(self, e):
             self.mouse_down = True
-            self.queue.clear()
+            if self.mode.get() != "live":
+                self.mode.set("live")
+                self.on_mode()
             self.target = self.c2w(e.x, e.y)
 
-        def on_drag(self, e):
+        def on_move(self, e):
             self.target = self.c2w(e.x, e.y)
 
-        def on_hover(self, e):
-            if not self.queue:
-                self.target = self.c2w(e.x, e.y)
+        def on_rom(self):
+            self.g.rom = ROM_PROFILES[self.rom_name.get()]
+            self.prev_phi3 = None
+            self.draw_reach()
+            if self.strokes_src is not None:
+                self.replan()
 
-        def play(self, name):
-            self.mode.set("ik")
+        # ------------------------------------------------------ input files
+        def open_svg(self):
+            p = filedialog.askopenfilename(filetypes=[("SVG", "*.svg"), ("All", "*.*")])
+            if p:
+                try:
+                    self.load_strokes(load_svg(p), p.split("/")[-1])
+                except Exception as ex:
+                    messagebox.showerror("SVG", f"Could not read SVG:\n{ex}")
+
+        def open_image(self):
+            p = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"),
+                                                      ("All", "*.*")])
+            if not p:
+                return
+            mode = self.img_mode.get()
+            try:
+                kw = {"spacing": self.hatch.get()} if mode == "hatch" else {}
+                strokes = load_image(p, mode, **kw)
+            except Exception as ex:
+                messagebox.showerror("Image", f"Could not trace image:\n{ex}")
+                return
+            self.load_strokes(strokes, p.split("/")[-1])
+
+        def load_strokes(self, strokes, name):
+            self.strokes_src = (strokes, name)
+            self.replan()
+
+        def replan(self):
+            if self.strokes_src is None or self.busy:
+                return
+            strokes, name = self.strokes_src
+            fitted = fit_to_box(strokes, PAPER)
+            if not fitted:
+                self.status.config(text=f"{name}: nothing to draw")
+                return
+            self.params.w_comfort = self.w_comfort.get()
+            self.params.power_gain = self.gain.get()
+            self.params.v_max = self.vmax.get()
             start = self.link.prev["P"] if self.link.prev else self.target
-            q = []
-            for stroke in shape(name):
-                for p in resample([start, stroke[0]], 1.0)[1:]:
-                    q.append((p, False))                 # pen-up travel
-                for p in resample(stroke, 1.0):
-                    q.append((p, True))
-                start = stroke[-1]
-            self.queue = q
+            self.busy = True
+            self.playing = False
+            npts = sum(len(s) for s in fitted)
+            self.status.config(text=f"planning {name}: {len(fitted)} strokes, {npts} vertices ...")
+            self.cv.delete("preview")
+            for s in fitted:
+                pts = [c for p in s for c in self.w2c(p)]
+                if len(pts) >= 4:
+                    self.cv.create_line(*pts, fill="#cfd8dc", tags="preview")
+            self.cv.tag_lower("preview")
+            self.cv.tag_lower("reach")
+            self.cv.tag_lower("paper")
 
-        # ---- drawing
+            def work():
+                try:
+                    plan = plan_job(self.g, fitted, start, self.params)
+                    self.root.after(0, lambda: self.plan_ready(plan, name))
+                except Exception as ex:
+                    msg = str(ex)
+                    self.root.after(0, lambda: self.plan_failed(msg))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def plan_ready(self, plan, name):
+            self.busy = False
+            self.plan = plan
+            self.play_t = 0.0
+            self.last_idx = 0
+            self.last_pen = None
+            self.mode.set("plan")
+            self.playing = True
+            st = plan.stats
+            self.status.config(text=f"{name}: {st['duration_s']:.1f}s job, ink {st['ink_mm']:.0f} mm, "
+                                    f"travel {st['travel_mm']:.0f} mm"
+                                    + (f", {st['unreachable']} unreachable samples" if st["unreachable"] else ""))
+            self.show_stats()
+
+        def plan_failed(self, msg):
+            self.busy = False
+            self.status.config(text=f"planning failed: {msg}")
+
+        def toggle_play(self):
+            if self.plan:
+                self.mode.set("plan")
+                self.playing = not self.playing
+
+        def restart(self):
+            if self.plan:
+                self.mode.set("plan")
+                self.play_t, self.last_idx, self.last_pen = 0.0, 0, None
+                self.playing = True
+
+        # ----------------------------------------------------------- stats
+        def show_stats(self):
+            st = self.plan.stats
+            row = lambda k, f: "  ".join(f"{v:{f}}" for v in st[k])
+            self.stats_lbl.config(text=(
+                f"job time        {st['duration_s']:8.1f} s\n"
+                f"ink / travel    {st['ink_mm']:6.0f} / {st['travel_mm']:.0f} mm\n"
+                f"∫ q̇ᵀMq̇ dt      {st['kinetic_integral']:10.5f}\n\n"
+                f"                 M1       M2       M3\n"
+                f"range   deg  {row('motor_range_deg', '8.1f')}\n"
+                f"peak    rpm  {row('peak_speed_rpm', '8.2f')}\n"
+                f"peak    N·m  {row('peak_torque_Nm', '8.4f')}\n"
+                f"rms     N·m  {row('rms_torque_Nm', '8.4f')}\n"
+                f"+work   J    {row('pos_work_J', '8.4f')}\n"
+                f"|work|  J    {row('abs_work_J', '8.4f')}\n\n"
+                f"masses {self.g.m1}/{self.g.m2}/{self.g.m3} kg, reflected motor\n"
+                f"inertia {self.g.J_motor[0]:.0e} kg·m² each, horizontal plane\n"
+                f"(no gravity, no friction)"))
+
+        def export(self):
+            if not self.plan:
+                return
+            p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+            if p:
+                export_csv(self.plan, p)
+                self.status.config(text=f"exported {len(self.plan.t)} samples to {p}")
+
+        def compare(self):
+            if self.strokes_src is None or self.busy:
+                return
+            fitted = fit_to_box(self.strokes_src[0], PAPER)
+            start = self.link.prev["P"] if self.link.prev else self.target
+            self.status.config(text="planning greedy baseline ...")
+            self.busy = True
+
+            def work():
+                gr = plan_job(self.g, fitted, start, self.params, method="greedy")
+                self.root.after(0, lambda: done(gr))
+
+            def done(gr):
+                self.busy = False
+                a, b = gr.stats, self.plan.stats
+                pct = lambda k: 100 * (1 - sum(np.atleast_1d(b[k])) / max(1e-12, sum(np.atleast_1d(a[k]))))
+                messagebox.showinfo("Min-energy DP vs greedy IK", (
+                    f"                 greedy      DP     saving\n"
+                    f"∫ q̇ᵀMq̇ dt     {a['kinetic_integral']:8.4f} {b['kinetic_integral']:8.4f}  {pct('kinetic_integral'):5.1f}%\n"
+                    f"|work| J       {sum(a['abs_work_J']):8.4f} {sum(b['abs_work_J']):8.4f}  {pct('abs_work_J'):5.1f}%\n"
+                    f"peak τ sum N·m {sum(a['peak_torque_Nm']):8.4f} {sum(b['peak_torque_Nm']):8.4f}  {pct('peak_torque_Nm'):5.1f}%\n"
+                    f"rms τ sum N·m  {sum(a['rms_torque_Nm']):8.4f} {sum(b['rms_torque_Nm']):8.4f}  {pct('rms_torque_Nm'):5.1f}%"))
+                self.status.config(text="comparison done")
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def show_plots(self):
+            if not self.plan:
+                return
+            pl = self.plan
+            w = tk.Toplevel(self.root)
+            w.title("Motor trajectories")
+            W, Hh = 900, 640
+            c = tk.Canvas(w, width=W, height=Hh, bg="white")
+            c.pack()
+            step = max(1, len(pl.t) // 1500)
+            t = pl.t[::step]
+            panels = [("shaft angle (deg)", np.degrees(pl.motors - pl.motors[0])[::step]),
+                      ("speed (rpm)", (pl.omega * 60 / (2 * math.pi))[::step]),
+                      ("torque (N·m)", pl.tau[::step])]
+            ph = Hh / 3
+            for i, (title, Y) in enumerate(panels):
+                y0, y1 = i * ph + 22, (i + 1) * ph - 14
+                lo, hi = float(Y.min()), float(Y.max())
+                if hi - lo < 1e-12:
+                    hi = lo + 1
+                X = lambda tt: 60 + (W - 80) * tt / max(t[-1], 1e-9)
+                Yc = lambda v: y1 - (y1 - y0) * (v - lo) / (hi - lo)
+                c.create_rectangle(60, y0, W - 20, y1, outline="#ddd")
+                if lo < 0 < hi:
+                    c.create_line(60, Yc(0), W - 20, Yc(0), fill="#eee")
+                c.create_text(64, y0 - 10, anchor="w", text=title, font=("Segoe UI", 9, "bold"))
+                c.create_text(56, y0, anchor="e", text=f"{hi:.3g}", font=("Segoe UI", 8))
+                c.create_text(56, y1, anchor="e", text=f"{lo:.3g}", font=("Segoe UI", 8))
+                for m in range(3):
+                    pts = [v for tt, yy in zip(t, Y[:, m]) for v in (X(tt), Yc(yy))]
+                    c.create_line(*pts, fill=MOTOR_COLS[m], width=1.5)
+            c.create_text(W - 20, Hh - 4, anchor="se", text=f"time 0 - {t[-1]:.1f} s   "
+                          "blue M1 shoulder · teal M2 elbow · purple M3 wrist", font=("Segoe UI", 8))
+
+        # --------------------------------------------------------- drawing
         def draw_static(self):
             c = self.cv
             x0, y0 = self.w2c((PAPER[0], PAPER[3]))
             x1, y1 = self.w2c((PAPER[2], PAPER[1]))
-            c.create_rectangle(x0, y0, x1, y1, fill="#fbf8ee", outline="#d8d2bd")
-            c.create_text(x0 + 4, y0 + 4, anchor="nw", text="paper", fill="#b5ad93", font=("Segoe UI", 8))
-            # body block behind shoulder
+            c.create_rectangle(x0, y0, x1, y1, fill="#fbf8ee", outline="#d8d2bd", tags="paper")
             bx0, by0 = self.w2c((-160, 130))
             bx1, by1 = self.w2c((-25, -130))
-            c.create_rectangle(bx0, by0, bx1, by1, fill="#eceff1", outline="#cfd8dc")
+            c.create_rectangle(bx0, by0, bx1, by1, fill="#eceff1", outline="#cfd8dc", tags="paper")
             c.create_text((bx0 + bx1) / 2, (by0 + by1) / 2, text="body\n\nM1 M2 M3\ncoaxial at\nshoulder",
-                          fill="#78909c", font=("Segoe UI", 8), justify="center")
-            # reach circles for the pen (approx, hand not counted)
-            g = self.g
-            rmax = math.sqrt(g.L1 ** 2 + g.L2 ** 2 + 2 * g.L1 * g.L2 * math.cos(g.elbow_min)) + g.L3
-            for r, dash in ((rmax, (4, 4)),):
-                a, b = self.w2c((-r, r)), self.w2c((r, -r))
-                c.create_oval(*a, *b, outline="#cfd8dc", dash=dash)
-            c.create_text(10, 10, anchor="nw", fill="#607d8b", font=("Segoe UI", 9), text=(
-                "blue = upper arm   green = forearm (+ tail)   orange = hand/pen\n"
-                "teal = elbow parallelogram (M2)   purple = wrist parallelograms + elbow bell-crank (M3)"))
+                          fill="#78909c", font=("Segoe UI", 8), justify="center", tags="paper")
+            c.create_text(10, 10, anchor="nw", fill="#607d8b", font=("Segoe UI", 9), tags="paper", text=(
+                "right arm, top view.  blue upper arm · green forearm · orange hand/pen\n"
+                "teal elbow parallelogram (M2) · purple wrist parallelograms + bell-crank (M3)\n"
+                "green shading = pen positions reachable within the range-of-motion profile"))
+            self.draw_reach()
+
+        def draw_reach(self):
+            self.cv.delete("reach")
+            if not self.show_reach.get():
+                return
+            x0w, y1w = self.c2w(0, 0)
+            cw = self.cv.winfo_width() if self.cv.winfo_width() > 10 else int(self.cv["width"])
+            ch = self.cv.winfo_height() if self.cv.winfo_height() > 10 else int(self.cv["height"])
+            x1w, y0w = self.c2w(cw, ch)
+            step = 6.0
+            xs, ys, ok = reachable_grid(self.g, x0w, x1w, y0w, y1w, step)
+            rgba = np.zeros(ok.shape + (4,), np.uint8)
+            rgba[ok] = (120, 200, 140, 60)
+            img = Image.fromarray(rgba[::-1], "RGBA")
+            wpx = int(round(len(xs) * step * self.s))
+            hpx = int(round(len(ys) * step * self.s))
+            img = img.resize((wpx, hpx), Image.NEAREST)
+            bg = Image.new("RGBA", img.size, (255, 255, 255, 0))
+            self._reach_img = ImageTk.PhotoImage(Image.alpha_composite(bg, img))
+            cx, cy = self.w2c((xs[0] - step / 2, ys[-1] + step / 2))
+            self.cv.create_image(cx, cy, anchor="nw", image=self._reach_img, tags="reach")
+            self.cv.tag_raise("reach", "paper")
 
         def render(self, st):
             c = self.cv
             c.delete("arm")
 
-            def ln(p, q, w, col, **kw):
-                c.create_line(*self.w2c(p), *self.w2c(q), width=w, fill=col, capstyle="round", tags="arm", **kw)
+            def ln(p, q, w, col):
+                c.create_line(*self.w2c(p), *self.w2c(q), width=w, fill=col, capstyle="round", tags="arm")
 
             def dot(p, r, col, fill="white"):
                 x, y = self.w2c(p)
                 c.create_oval(x - r, y - r, x + r, y + r, outline=col, fill=fill, width=2, tags="arm")
 
             S, E, W, P = st["S"], st["E"], st["W"], st["P"]
-            # wrist chain
             c.create_polygon(*self.w2c(E), *self.w2c(st["A2"]), *self.w2c(st["B1"]),
                              fill="#e6d9f5", outline=PURPLE, width=2, tags="arm")
             ln(S, st["A1"], 5, PURPLE)
             ln(st["A1"], st["A2"], 2, PURPLE)
             ln(st["B1"], st["B2"], 2, PURPLE)
             ln(W, st["B2"], 5, PURPLE)
-            # elbow drive
             ln(S, st["C2"], 6, TEAL)
             ln(st["C2"], st["T2"], 2.5, TEAL)
-            # main links
             ln(S, E, 12, BLUE)
             ln(st["T2"], W, 9, GREEN)
             ln(W, P, 6, ORANGE)
             for p in (st["A1"], st["A2"], st["B1"], st["B2"], st["C2"], st["T2"]):
                 dot(p, 3, GREY)
-            for p, col in ((E, BLUE), (W, GREEN)):
-                dot(p, 6, col)
-            for r, col in ((14, PURPLE), (11, TEAL), (8, BLUE)):       # coaxial shafts
+            dot(E, 6, BLUE)
+            dot(W, 6, GREEN)
+            for r, col in ((14, PURPLE), (11, TEAL), (8, BLUE)):
                 dot(S, r, col, fill="")
             dot(P, 4, "red", fill="red" if self.pen else "white")
-            if self.mode.get() == "ik":
+            if self.mode.get() == "live":
                 x, y = self.w2c(self.target)
                 col = "#e53935" if self.unreachable else "#90a4ae"
                 c.create_line(x - 7, y, x + 7, y, fill=col, tags="arm")
@@ -469,68 +593,98 @@ def run_gui():
         def readout(self, st):
             d = math.degrees
             m = st["margins"]
-            m1, m2, m3 = (d(a) for a in st["inputs"])
-            txt = (f"inputs   M1 {m1:7.1f}  M2 {m2:7.1f}  M3 {m3:7.1f}\n"
-                   f"shoulder {d(st['phi1']):7.1f}\n"
-                   f"elbow    {d(wrap(st['phi2'] - st['phi1'])):7.1f}  (relative)\n"
-                   f"wrist    {d(wrap(st['phi3'] - st['phi2'])):7.1f}  (relative)\n"
-                   f"hand abs {d(wrap(st['phi3'])):7.1f}\n"
-                   f"pen      ({st['P'][0]:6.1f}, {st['P'][1]:6.1f}) mm\n\n"
-                   f"transmission margin (1 = ideal, 0 = dead point)\n"
-                   f"  elbow pgram   {m[0]:.2f}\n"
-                   f"  wrist stage A {m[1]:.2f}\n"
-                   f"  wrist stage B {m[2]:.2f}\n")
+            r = self.g.rom
+            el, wr = wrap(st["phi2"] - st["phi1"]), wrap(st["phi3"] - st["phi2"])
+
+            def rng(v, lim):
+                f = (v - lim[0]) / (lim[1] - lim[0])
+                bar = "".join("█" if abs(i / 9 - f) < 0.06 else "·" for i in range(10))
+                return f"[{bar}]"
+
+            txt = (f"inputs  M1 {d(st['inputs'][0]):7.1f}  M2 {d(st['inputs'][1]):7.1f}  M3 {d(st['inputs'][2]):7.1f}\n"
+                   f"shoulder {d(st['phi1']):7.1f}  {rng(st['phi1'], r.shoulder)}  ({d(st['phi1']) + 90:+.0f} from lateral)\n"
+                   f"elbow    {d(el):7.1f}  {rng(el, r.elbow)}  flexion\n"
+                   f"wrist    {d(wr):7.1f}  {rng(wr, r.wrist)}\n"
+                   f"pen ({st['P'][0]:6.1f}, {st['P'][1]:6.1f}) mm\n"
+                   f"transmission  elbow {m[0]:.2f}  wristA {m[1]:.2f}  wristB {m[2]:.2f}\n")
+            if self.mode.get() == "plan" and self.plan is not None and self.cur_idx is not None:
+                i = self.cur_idx
+                w = self.plan.omega[i] * 60 / (2 * math.pi)
+                tq = self.plan.tau[i]
+                txt += (f"t {self.plan.t[i]:6.2f}/{self.plan.t[-1]:.2f} s\n"
+                        f"rpm  {w[0]:7.2f} {w[1]:7.2f} {w[2]:7.2f}\n"
+                        f"N·m  {tq[0]:7.4f} {tq[1]:7.4f} {tq[2]:7.4f}\n")
             if st["flipped"]:
-                txt += "\n!! passed a dead point: a parallelogram\n   flipped to anti-parallelogram"
+                txt += "!! dead point passed: parallelogram flipped\n"
             elif min(m) < 0.25:
-                txt += "\n!  near a dead point"
+                txt += "!  near a dead point\n"
             if self.unreachable:
-                txt += "\n!  target unreachable / outside limits"
+                txt += "!  target outside range of motion\n"
             self.info.config(text=txt, fg="#c62828" if st["flipped"] else "black")
 
-        # ---- main loop
+        # ------------------------------------------------------- main loop
         def tick(self):
-            dt = 0.016
-            g = self.g
-            if self.mode.get() == "ik":
-                if self.queue:
-                    n = max(1, int(self.speed.get() * dt))     # queue is 1 mm spaced
-                    for _ in range(n):
-                        if not self.queue:
-                            break
-                        self.target, self.pen = self.queue.pop(0)
-                        self.step_ik(g, draw=True)
-                else:
-                    self.pen = self.mouse_down
-                    self.step_ik(g, draw=True)
-            else:
+            frame = 0.016
+            mode = self.mode.get()
+            if mode == "plan" and self.plan is not None:
+                self.step_plan(frame)
+            elif mode == "manual":
                 self.pen = self.pen_var.get()
                 st = self.link.solve(*(math.radians(v.get()) for v in self.mvars), track=True)
                 self.unreachable = st is None
                 if st:
-                    self.ink(st)
+                    self.ink([st["P"]])
+            else:
+                self.pen = self.mouse_down
+                fixed = math.radians(self.hand_deg.get()) if self.hand_mode.get() == "fixed" else None
+                sol = solve_ik(self.g, self.target, self.prev_phi3, fixed)
+                self.unreachable = sol is None
+                if sol:
+                    self.prev_phi3 = sol["phi3"]
+                    st = self.link.solve(*sol["inputs"])
+                    if st:
+                        self.ink([st["P"]])
             if self.link.prev:
                 self.render(self.link.prev)
                 self.readout(self.link.prev)
-            self.root.after(int(dt * 1000), self.tick)
+            self.root.after(int(frame * 1000), self.tick)
 
-        def step_ik(self, g, draw):
-            fixed = math.radians(self.hand_deg.get()) if self.hand_mode.get() == "fixed" else None
-            sol = solve_ik(g, self.target, self.prev_phi3, fixed)
-            self.unreachable = sol is None
-            if sol is None:
+        def step_plan(self, frame):
+            pl = self.plan
+            if self.playing:
+                self.play_t = min(self.play_t + frame * self.mult.get(), pl.t[-1])
+            idx = min(int(self.play_t / self.params.dt), len(pl.t) - 1)
+            pts = []
+            for i in range(self.last_idx, idx + 1):
+                self.pen = bool(pl.pen[i])
+                st = self.link.solve(*pl.motors[i])          # FK of the real linkage
+                if st is None:
+                    continue
+                if self.pen:
+                    pts.append(st["P"])
+                else:
+                    self.ink(pts)
+                    pts = []
+                    self.last_pen = None
+            self.ink(pts)
+            self.last_idx = max(self.last_idx, idx + 1)
+            self.cur_idx = idx
+            self.unreachable = not pl.valid[idx]
+            self.prog["value"] = 1000 * self.play_t / max(pl.t[-1], 1e-9)
+            if self.play_t >= pl.t[-1]:
+                self.playing = False
+
+        def ink(self, pts):
+            if not self.pen and not pts:
+                self.last_pen = None
                 return
-            self.prev_phi3 = sol["phi3"]
-            st = self.link.solve(*sol["inputs"])
-            if st and draw:
-                self.ink(st)
-
-        def ink(self, st):
-            P = st["P"]
-            if self.pen and self.last_pen is not None and dist(P, self.last_pen) < 20:
-                self.cv.create_line(*self.w2c(self.last_pen), *self.w2c(P), fill="#1a237e", width=2,
-                                    capstyle="round", tags="ink")
-            self.last_pen = P if self.pen else None
+            if not pts:
+                return
+            chain = ([self.last_pen] if self.last_pen is not None else []) + list(pts)
+            if len(chain) >= 2:
+                xy = [v for p in chain for v in self.w2c(p)]
+                self.cv.create_line(*xy, fill="#1a237e", width=2, capstyle="round", joinstyle="round", tags="ink")
+            self.last_pen = chain[-1] if self.pen else None
 
     root = tk.Tk()
     App(root)
