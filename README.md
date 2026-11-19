@@ -9,7 +9,16 @@ remotely through parallelogram linkages.
 pip install -r requirements.txt
 python arm_linkage.py          # simulator
 python arm_linkage.py --test   # numerical self-checks
+python cam_drive.py heart      # encode a drawing onto cams (one motor)
+python parts.py heart          # printable parts -> cad/stl/*.stl, cad/assembly.step
 ```
+
+![parts preview](cad/preview.png)
+
+**One motor:** the drawing is stored in a stack of groove cams on one
+camshaft (one revolution = one drawing). Each cam drives one input shaft via a
+3:1 gear sector; a fourth cam lifts the pen. See [DESIGN.md](DESIGN.md) for
+the options considered, capacity limits, layer stack, BOM and print notes.
 
 ## Mechanism
 

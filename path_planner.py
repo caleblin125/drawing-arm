@@ -38,6 +38,7 @@ class PlanParams:
     pen_dwell: float = 0.08        # s to lift or lower the pen
     w_energy: float = 1.0          # weight of kinetic-energy term
     w_comfort: float = 0.05        # weight of ROM-discomfort term (per second)
+    w_hand: float = 0.0            # extra penalty on hand-angle rate (cam mode)
     band: int = 4                  # DP: max hand-angle grid steps per DP sample
     dp_stride: int = 2             # DP runs on every n-th sample, then interpolated
 
@@ -177,6 +178,8 @@ def plan_redundancy(g, xy, p, chunk=1500):
         dq = wrap_np(q[:, None, :, :] - qprev[:, src, :])                       # (n,d,K,3)
         M = mass_matrix(H, q)                                                     # (n,K,3,3)
         trans = p.w_energy * np.einsum("ndki,nkij,ndkj->ndk", dq, M, dq) / p.dt
+        if p.w_hand:
+            trans = trans + p.w_hand * dq[..., 2] ** 2 / p.dt
         for i in range(c1 - c0):
             n = c0 + i
             if prev is None:
