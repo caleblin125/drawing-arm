@@ -10,8 +10,14 @@ pip install -r requirements.txt
 python arm_linkage.py          # simulator
 python arm_linkage.py --test   # numerical self-checks
 python cam_drive.py heart      # encode a drawing onto cams (one motor)
-python parts.py heart          # printable parts -> cad/stl/*.stl, cad/assembly.step
+python parts.py heart          # printable parts -> cad/stl/*.stl, cad/assembly.step, cad/springs.md
+python structural.py heart     # stress / strain / pen error report -> cad/strain_heart.md
 ```
+
+**All parameters live in [`params.toml`](params.toml)**: arm lengths, masses,
+range-of-motion profiles, planner weights, gears, rollers, spring preload,
+layer thicknesses, link widths, material and load cases. Every module reads
+its defaults from it (`config.py`).
 
 ![parts preview](cad/preview.png)
 

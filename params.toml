@@ -1,0 +1,149 @@
+# =====================================================================
+# drawing-arm parameters - the single source of truth.
+# Every module (simulator, planner, cams, CAD parts, structural check)
+# reads its defaults from here.  Units: mm, kg, s, N; angles in degrees.
+# Edit, then re-run:  python parts.py heart   /   python structural.py heart
+# =====================================================================
+
+[paper]
+x0 = 250.0          # drawing area in front of the shoulder (shoulder axle = origin)
+y0 = -110.0
+x1 = 510.0
+y1 = 110.0
+
+# ---------------------------------------------------------------- arm
+[arm]
+L1 = 300.0          # upper arm (shoulder -> elbow)
+L2 = 250.0          # forearm (elbow -> wrist)
+L3 = 70.0           # hand (wrist -> pen tip)
+r_e = 60.0          # elbow drive crank at S = forearm tail at E
+r_a = 45.0          # wrist crank at S = bell-crank arm A at E
+r_b = 40.0          # bell-crank arm B at E = hand crank at W
+off_a = 0.0         # crank A angle relative to hand direction (deg)
+off_b = 90.0        # crank B angle relative to hand direction (deg) -> L-shaped bell-crank
+margin_min = 0.30   # min |sin| transmission margin accepted by the IK
+
+[arm.mass]
+m1 = 0.25           # upper arm + parts riding on it
+m2 = 0.20           # forearm + couplers
+m3 = 0.08           # hand + pen
+J_motor = [2e-4, 2e-4, 2e-4]   # reflected drive inertia at each shaft (kg m^2)
+
+# -------------------------------------------------------- range of motion
+[rom]
+default = "human: palm sideways (wrist flex/ext)"
+
+[[rom.profile]]
+name = "human: palm sideways (wrist flex/ext)"
+shoulder = [-135.0, 40.0]   # absolute upper-arm angle (-90 = straight out sideways)
+elbow = [20.0, 145.0]       # flexion; 0 is a parallelogram dead point
+wrist = [-70.0, 80.0]       # extension / flexion
+
+[[rom.profile]]
+name = "human: palm down (radial/ulnar dev)"
+shoulder = [-135.0, 40.0]
+elbow = [20.0, 145.0]
+wrist = [-30.0, 20.0]
+
+[[rom.profile]]
+name = "mechanical only"
+shoulder = [-180.0, 180.0]
+elbow = [20.0, 160.0]
+wrist = [-100.0, 100.0]
+
+# ------------------------------------------------------------- planner
+[plan]
+dt = 0.01           # s
+power_gain = 28.0   # v = k * R^(1/3)  (2/3 power law)
+v_min = 8.0         # mm/s
+v_max = 220.0       # mm/s pen down
+a_max = 1500.0      # mm/s^2
+pen_dwell = 0.08    # s
+w_energy = 1.0      # kinetic-energy weight
+w_comfort = 0.05    # range-of-motion discomfort weight
+w_hand = 0.0        # hand-rate penalty
+band = 4            # DP hand-angle steps per sample
+dp_stride = 2
+
+[plan.cam]          # overrides used when planning for the cam drive
+a_max = 500.0
+w_hand = 0.02
+pen_dwell = 0.1
+
+# ---------------------------------------------------------- cam drive
+[drive]
+D_SO = 150.0        # shoulder axle -> camshaft distance
+gamma_O = 150.0     # direction of the camshaft from the shoulder (deg)
+module = 1.5        # gear module
+z_hub = 30          # teeth on the hub sectors
+z_follow = [90]     # follower sector teeth (3:1)
+wall = 3.0          # groove wall thickness
+shaft_d = 8.0       # camshaft diameter
+alpha_max = 35.0    # max pressure angle (deg)
+min_wall_radius = 3.0   # min convex radius of a groove wall (contact stress)
+n = 1440            # cam samples per revolution
+return_time = 1.2   # s pen-up return to the start pose
+pen_rise = 2.0      # pen-lift roller rise (mm)
+pen_ramp_deg = 8.0  # cam degrees per pen up/down ramp
+cam_stack = ["M2", "M1", "M3", "pen"]   # cams bottom -> top (must match parts.py LAYER)
+
+[drive.roller]      # cam follower roller bearing
+name = "684ZZ"
+bore = 4.0
+od = 9.0
+width = 4.0
+
+[drive.preload]     # anti-backlash torsion springs on the shoulder axle (see springs.py)
+hub_torque = [0.30, 0.22, 0.08]   # N m spring torque on the M1, M2, M3 hubs (> peak running torque)
+sign = [1, 1, 1]                  # +1 = CCW on the hub
+torque_variation = 0.25           # allowed +- torque change over the hub travel (whole paper)
+max_od = 21.0                     # spring OD limit (hub boss is 20 mm)
+
+# ------------------------------------------------------------- parts
+[parts]
+gap = 1.0           # washer gap between layers
+# layer thicknesses, bottom -> top (see parts.py for what lives on each layer)
+layer_thickness = [9.0, 8.0, 9.0, 8.0, 6.0, 7.0, 8.0, 7.0, 6.0]
+base_thickness = 6.0
+pin_bore = 4.3      # 4 mm pins
+axle_bore = 8.25    # 8 mm rods
+fit_pin = 3.95      # press fit for roller studs
+dowel_fit = 2.9     # 3 mm dowel, press
+dowel_free = 3.1
+backlash = 0.10     # gear tooth thinning per gear (mm)
+groove_clearance = 0.15   # roller <-> groove
+pen_bore = 10.4
+pen_collar_extra = 6.0
+setscrew_d = 2.6
+standoff_od = 9.0   # follower pivot standoffs / spring posts
+spacer_od = 14.0    # shoulder axle and camshaft spacers
+
+[parts.radius]      # end-boss radii of each link [root, tip] (link width = 2 x radius)
+upper_arm = [11.0, 9.0]
+upper_arm_slot = [3.0, 28.0]      # lightening slot [half-width, inset from each end]
+forearm = [7.0, 9.0, 7.5]         # [tail T2, elbow E, wrist W]
+forearm_slot = [2.5, 26.0]
+crank_M2 = [10.0, 7.0]
+crank_M3 = [10.0, 6.0]
+coupler_E = 6.0
+coupler_A = 5.5
+coupler_B = 5.5
+bell = [9.0, 6.0]
+hand = [8.0, 9.0]
+hand_crank = [8.0, 6.0]
+follower_arm = [7.0, 6.0]
+follower_spoke = [7.0, 4.0]
+hub = 10.0
+
+# ------------------------------------------------- structural check
+[material]
+name = "PLA (FDM, in-plane)"
+E = 3000.0          # MPa
+strength = 45.0     # MPa
+nu = 0.35
+
+[loads]
+pen_mu = 0.4        # pen friction coefficient
+pen_normal = 1.0    # N pen pressure
+push = 5.0          # N handling push on the pen tip (case C)
+gear_Kv = 1.5       # dynamic/roughness factor on gear loads

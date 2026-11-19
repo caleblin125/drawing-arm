@@ -22,7 +22,7 @@ from arm_kinematics import (D, DEFAULT_ROM, ROM_PROFILES, Geometry, Linkage,
 from path_planner import PlanParams, export_csv, plan_job
 from vector_input import fit_to_box, load_image, load_svg
 
-PAPER = (250.0, -110.0, 510.0, 110.0)          # x0, y0, x1, y1 (mm)
+from config import PAPER                       # x0, y0, x1, y1 (mm) from params.toml
 
 
 # ------------------------------------------------------------ built-in shapes

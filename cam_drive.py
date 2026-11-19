@@ -27,26 +27,35 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from arm_kinematics import Geometry
+from config import CFG
 
 D = math.radians
 
 
+_DR = CFG["drive"]
+
+
 @dataclass
 class DriveParams:
-    D_SO: float = 125.0                # shoulder axle -> camshaft distance (mm)
-    gamma_O: float = D(150)          # direction of the camshaft from S
-    module: float = 1.0              # gear module (mm)
-    z_hub: int = 30                  # teeth on the hub sectors (pitch r = 15)
-    z_follow: tuple = (90,)          # follower sector teeth (fixed 3:1 -> gears reusable across drawings)
-    roller_r: float = 3.5            # MR74 bearing (4x7x2.5) as cam roller
-    wall: float = 3.0                # groove wall thickness
-    shaft_r: float = 4.0             # 8 mm camshaft
-    alpha_max: float = D(35)         # max pressure angle (groove cam, roller)
-    n: int = 1440                    # cam samples per revolution (0.25 deg)
-    return_time: float = 1.2         # s, pen-up return to the start pose
-    pen_rise: float = 2.0            # mm roller rise for pen lift (lever/cable amplifies)
-    pen_ramp_deg: float = 8.0        # cam degrees per pen up/down ramp
-    pen_ramp: float = 0.25           # s (set by plan_for_cams from pen_ramp_deg)
+    """Defaults come from params.toml [drive]."""
+    D_SO: float = _DR["D_SO"]                    # shoulder axle -> camshaft distance (mm)
+    gamma_O: float = D(_DR["gamma_O"])           # direction of the camshaft from S
+    module: float = _DR["module"]                # gear module (mm)
+    z_hub: int = _DR["z_hub"]                    # teeth on the hub sectors
+    z_follow: tuple = tuple(_DR["z_follow"])     # follower sector teeth candidates
+    roller_r: float = _DR["roller"]["od"] / 2    # cam roller bearing radius
+    roller_w: float = _DR["roller"]["width"]
+    wall: float = _DR["wall"]                    # groove wall thickness
+    shaft_r: float = _DR["shaft_d"] / 2
+    alpha_max: float = D(_DR["alpha_max"])       # max pressure angle
+    min_wall_radius: float = _DR["min_wall_radius"]
+    n: int = _DR["n"]                            # cam samples per revolution
+    return_time: float = _DR["return_time"]      # s, pen-up return to the start pose
+    pen_rise: float = _DR["pen_rise"]            # mm roller rise for pen lift
+    pen_ramp_deg: float = _DR["pen_ramp_deg"]    # cam degrees per pen up/down ramp
+    pen_ramp: float = 0.25                       # s (set by plan_for_cams)
+    cam_stack: tuple = tuple(_DR["cam_stack"])   # cams bottom -> top
+    standoff_r: float = CFG["parts"]["standoff_od"] / 2
 
 
 # ------------------------------------------------------------ loop closing
@@ -120,8 +129,11 @@ def _circle_x(c0, r0, c1, r1):
     return [m + h * perp, m - h * perp]
 
 
-def synth_axis(theta, rel, p, S, O, geared=True, name=""):
+def synth_axis(theta, rel, p, S, O, geared=True, name="", min_pivot=0.0, keepout=None):
     """rel: (n,) desired OUTPUT angle relative to its mean (rad).
+    min_pivot: the follower pivot (and its standoff) must be at least this far
+    from the camshaft, i.e. clear of every cam lower in the stack.
+    keepout(F) -> clearance (mm) of the pivot standoff to lower followers' swept areas.
     Returns the best design dict or None."""
     best = None
     ratios = [(zf, zf / p.z_hub) for zf in p.z_follow] if geared else [(0, 1.0)]
@@ -136,7 +148,7 @@ def synth_axis(theta, rel, p, S, O, geared=True, name=""):
                 if geared:
                     Fs = _circle_x(S, a, O, c)
                 else:
-                    Fs = [O + c * np.array([math.cos(ang), math.sin(ang)]) for ang in (D(60), D(240))]
+                    Fs = [O + c * np.array([math.cos(ang), math.sin(ang)]) for ang in np.radians(np.arange(0, 360, 30))]
                 for F in Fs:
                     for Rm in _circle_x(O, Rp, F, l):
                         psi0 = math.atan2(*(Rm - F)[::-1])
@@ -144,12 +156,14 @@ def synth_axis(theta, rel, p, S, O, geared=True, name=""):
                         ev = evaluate_cam(theta, O, F, l, psi, p)
                         if not ev["monotone"] or ev["alpha"].max() > p.alpha_max:
                             continue
-                        if np.abs(ev["rho"]).min() < p.roller_r + 0.5:
+                        if np.abs(ev["rho"]).min() < p.roller_r + p.min_wall_radius:
                             continue
                         if ev["inner"] < p.shaft_r + 3:
                             continue
                         # follower pivot boss must clear the cam
-                        if np.hypot(*(F - O)) < ev["outer"] + 6:
+                        if np.hypot(*(F - O)) < max(ev["outer"], min_pivot) + p.standoff_r + 1:
+                            continue
+                        if keepout is not None and keepout(F) < 1.0:
                             continue
                         if geared and np.hypot(*(S - O)) < ev["outer"] + p.module * p.z_hub / 2 + 3:
                             continue
@@ -158,6 +172,34 @@ def synth_axis(theta, rel, p, S, O, geared=True, name=""):
                             best = dict(name=name, score=score, zf=zf, G=G, l=l, Rp=Rp, F=F, psi=psi,
                                         a=a, **ev)
     return best
+
+
+def _seg_dist(q, a, b):
+    ab = b - a
+    t = np.clip(np.dot(q - a, ab) / max(np.dot(ab, ab), 1e-12), 0, 1)
+    return float(np.hypot(*(q - (a + t * ab))))
+
+
+def swept_keepout(designs, p, arm_r=7.0):
+    """Clearance of a vertical standoff at F to the swept arms/sectors of the
+    given (lower) follower designs."""
+    def fn(F):
+        best = 1e9
+        for d in designs:
+            idx = np.linspace(0, len(d["psi"]) - 1, 36).astype(int)
+            for k in idx:
+                R = d["F"] + d["l"] * np.array([math.cos(d["psi"][k]), math.sin(d["psi"][k])])
+                best = min(best, _seg_dist(F, d["F"], R) - arm_r - p.standoff_r)
+            if d.get("zf"):
+                rs = p.module * d["zf"] / 2
+                dd = np.hypot(*(F - d["F"]))
+                a_m = math.atan2(-d["F"][1], -d["F"][0])
+                aq = math.atan2(*(F - d["F"])[::-1])
+                if abs((aq - a_m + math.pi) % (2 * math.pi) - math.pi) < np.ptp(d["psi"]) / 2 + 0.3:
+                    best = min(best, abs(dd - (rs - 2)) - (1.5 * p.module + 5) - p.standoff_r)
+            best = min(best, np.hypot(*(F - d["F"])) - 2 * p.standoff_r)
+        return best
+    return fn
 
 
 @dataclass
@@ -177,15 +219,28 @@ def design_cams(plan, g: Geometry, p: DriveParams = None):
     theta, M, pen, T = periodic_profiles(plan, p)
     S = np.zeros(2)
     O = p.D_SO * np.array([math.cos(p.gamma_O), math.sin(p.gamma_O)])
-    axes = []
-    for k, name in enumerate(("M1 shoulder", "M2 elbow", "M3 wrist")):
-        rel = M[:, k] - M[:, k].mean()
-        des = synth_axis(theta, rel, p, S, O, True, name)
+    names = {"M1": (0, "M1 shoulder"), "M2": (1, "M2 elbow"), "M3": (2, "M3 wrist")}
+    axes = [None, None, None]
+    pen_axis = None
+    lower_outer = 0.0                            # largest cam below the current follower
+    lower = []                                   # designs of followers below
+    for key in p.cam_stack:                      # bottom -> top: pivots must clear lower cams
+        if key == "pen":
+            pen_rel = (1 - pen)                  # 1 = lifted; scaled to a rise per arm length
+            pen_axis = synth_axis(theta, pen_rel - pen_rel.mean(), p, S, O, False, "pen lift",
+                                  min_pivot=lower_outer, keepout=swept_keepout(lower, p))
+            des = pen_axis
+        else:
+            k, name = names[key]
+            rel = M[:, k] - M[:, k].mean()
+            des = synth_axis(theta, rel, p, S, O, True, name, min_pivot=lower_outer,
+                             keepout=swept_keepout(lower, p))
+            if des is not None:
+                des["M_mean"] = float(M[:, k].mean())
+            axes[k] = des
         if des is not None:
-            des["M_mean"] = float(M[:, k].mean())
-        axes.append(des)
-    pen_rel = (1 - pen)                          # 1 = lifted; scaled to a rise per arm length
-    pen_axis = synth_axis(theta, pen_rel - pen_rel.mean(), p, S, O, False, "pen lift")
+            lower_outer = max(lower_outer, des["outer"])
+            lower.append(des)
     return CamSet(p, theta, M, pen, T, O, axes, pen_axis)
 
 
@@ -238,7 +293,7 @@ def plan_for_cams(g, strokes, p: DriveParams = None, iters=3):
     p = p or DriveParams()
     strokes = order_strokes(strokes, strokes[0][0])
     start = strokes[0][0]
-    pp = PlanParams(a_max=500.0, w_hand=0.02, pen_dwell=0.1)
+    pp = PlanParams(**CFG["plan"].get("cam", {}))
     plan = None
     for _ in range(iters):
         plan = plan_job(g, strokes, start, pp)

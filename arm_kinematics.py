@@ -19,6 +19,8 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
+from config import CFG
+
 TAU = 2 * math.pi
 D = math.radians
 
@@ -35,45 +37,39 @@ class ROM:
     wrist: tuple
 
 
-# Typical adult active ROM (clinical goniometry norms, e.g. AAOS):
-#   shoulder horizontal adduction ~130 deg, horizontal abduction ~45 deg
-#     (measured from the arm pointing straight out sideways = phi1 -90 deg)
-#   elbow flexion 0-145 deg (0 is a parallelogram dead point -> 20 deg min)
-#   wrist flexion 80 / extension 70, radial dev 20 / ulnar dev 30
+# Profiles come from params.toml ([[rom.profile]]).  Typical adult active ROM
+# (clinical goniometry norms, e.g. AAOS): shoulder horizontal adduction ~130 deg /
+# abduction ~45 deg from straight-out-sideways (phi1 = -90); elbow flexion 0-145
+# (0 is a parallelogram dead point -> 20 min); wrist flex 80 / ext 70, or radial
+# 20 / ulnar 30 deviation.
 ROM_PROFILES = {
-    "human: palm sideways (wrist flex/ext)": ROM(
-        "human: palm sideways (wrist flex/ext)",
-        shoulder=(D(-90 - 45), D(-90 + 130)), elbow=(D(20), D(145)), wrist=(D(-70), D(80))),
-    "human: palm down (radial/ulnar dev)": ROM(
-        "human: palm down (radial/ulnar dev)",
-        shoulder=(D(-90 - 45), D(-90 + 130)), elbow=(D(20), D(145)), wrist=(D(-30), D(20))),
-    "mechanical only": ROM(
-        "mechanical only",
-        shoulder=(D(-180), D(180)), elbow=(D(20), D(160)), wrist=(D(-100), D(100))),
+    pr["name"]: ROM(pr["name"], shoulder=tuple(map(D, pr["shoulder"])),
+                    elbow=tuple(map(D, pr["elbow"])), wrist=tuple(map(D, pr["wrist"])))
+    for pr in CFG["rom"]["profile"]
 }
-DEFAULT_ROM = "human: palm sideways (wrist flex/ext)"
+DEFAULT_ROM = CFG["rom"]["default"]
+_A, _M = CFG["arm"], CFG["arm"]["mass"]
 
 
 # -------------------------------------------------------------------- geometry
 @dataclass
 class Geometry:
-    L1: float = 300.0          # upper arm   (shoulder -> elbow)   ~ human humerus
-    L2: float = 250.0          # forearm     (elbow -> wrist)      ~ human ulna
-    L3: float = 70.0           # hand        (wrist -> pen tip)
-    r_e: float = 60.0          # elbow drive crank at S  = forearm tail at E
-    r_a: float = 45.0          # wrist crank at S        = bell-crank arm A at E
-    r_b: float = 40.0          # bell-crank arm B at E   = hand crank at W
-    off_a: float = 0.0         # crank A angle relative to hand direction
-    off_b: float = D(90)       # crank B angle relative to hand direction (L bell-crank)
-    margin_min: float = 0.30   # min |sin| transmission margin allowed in IK
+    """Defaults come from params.toml [arm] / [arm.mass]."""
+    L1: float = _A["L1"]               # upper arm   (shoulder -> elbow)
+    L2: float = _A["L2"]               # forearm     (elbow -> wrist)
+    L3: float = _A["L3"]               # hand        (wrist -> pen tip)
+    r_e: float = _A["r_e"]             # elbow drive crank at S  = forearm tail at E
+    r_a: float = _A["r_a"]             # wrist crank at S        = bell-crank arm A at E
+    r_b: float = _A["r_b"]             # bell-crank arm B at E   = hand crank at W
+    off_a: float = D(_A["off_a"])      # crank A angle relative to hand direction
+    off_b: float = D(_A["off_b"])      # crank B angle relative to hand direction
+    margin_min: float = _A["margin_min"]
     rom: ROM = field(default_factory=lambda: ROM_PROFILES[DEFAULT_ROM])
-    # mass model (uniform rods + pen/hand lump) - used for energy & torque
-    m1: float = 0.25           # upper arm + couplers riding on it
-    m2: float = 0.20           # forearm + couplers
-    m3: float = 0.08           # hand + pen holder + pen
-    # rotor + gearbox inertia reflected to each output shaft (kg m^2).
-    # Each motor turns an ABSOLUTE angle, so this just adds to the diagonal.
-    J_motor: tuple = (2e-4, 2e-4, 2e-4)
+    m1: float = _M["m1"]
+    m2: float = _M["m2"]
+    m3: float = _M["m3"]
+    # rotor + gearbox inertia reflected to each output shaft (kg m^2)
+    J_motor: tuple = tuple(_M["J_motor"])
 
     @property
     def lengths_m(self):
@@ -276,3 +272,16 @@ def inverse_dynamics(H, q, qd, qdd):
 def kinetic_energy(H, q, qd):
     M = mass_matrix(H, q)
     return 0.5 * np.einsum("...j,...jk,...k->...", qd, M, qd)
+
+
+def paper_motor_range(g):
+    """Motor-shaft angle range needed to reach the whole paper (any drawing)."""
+    from config import PAPER
+    M = []
+    for x in np.linspace(PAPER[0], PAPER[2], 14):
+        for y in np.linspace(PAPER[1], PAPER[3], 12):
+            s = solve_ik(g, (x, y))
+            if s:
+                M.append(s["inputs"])
+    M = np.unwrap(np.array(M), axis=0)
+    return list(zip(M.min(0), M.max(0)))

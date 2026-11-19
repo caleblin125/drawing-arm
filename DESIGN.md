@@ -27,59 +27,85 @@ motor ──worm 1:N──> camshaft O (one rev per drawing)
                       └─ cam pen ─ roller ── pen lever ── Bowden cable ── pen holder (spring return)
 ```
 
-* **Groove (positive-drive) cams** – no return springs on the arm axes, so
-  the follower can't lift off; roller = MR74ZZ bearing on a 4 mm pin.
-* **3:1 gear sectors** amplify a ±12° follower swing into the ±35° the shaft
-  needs, which keeps cams small. Sectors cover the *whole paper* range, so
+All numbers below come from **`params.toml`** – edit it and re-run
+`python parts.py heart` and `python structural.py heart`.
+
+* **Groove (positive-drive) cams** – the follower can't lift off; roller =
+  684ZZ bearing (4×9×4) on a 4 mm stub pin. Groove walls keep a convex radius
+  ≥ 3 mm (`min_wall_radius`) to limit contact stress.
+* **3:1 gear sectors, module 1.5, 8 mm face** amplify a ±12° follower swing
+  into the ±35° the shaft needs. Sectors cover the *whole paper* range, so
   they are reusable for any drawing.
-* **Synthesis constraints** per cam: pressure angle ≤ 35°, groove curvature
-  radius > roller radius (no undercut), monotone pitch curve, hub/pivot
-  clearance. Smallest feasible cam wins.
+* **Anti-backlash torsion springs** (`springs.py`): one around the fixed
+  shoulder axle under each hub (keyed collar on the axle's D-flat + leg hole in
+  the hub). Hub torque 0.30 / 0.22 / 0.08 N·m (M1/M2/M3) exceeds the most the
+  arm ever needs, so gears and cam rollers never change flank → gear backlash
+  and groove clearance no longer move the pen. Wire, coils and wind-up are sized
+  automatically (`cad/springs.md`).
+* **Synthesis constraints** per cam: pressure angle ≤ 35°, groove wall radius,
+  monotone pitch curve; cams are designed bottom-to-top so each follower's
+  pivot standoff clears every cam *and swept follower* below it.
 * **Cam-friendly planning** (`plan_for_cams`): gentler accelerations, hand
   angle held steady (often the wrist cam becomes a plain circle, i.e. M3 is
   idle), loop starts on the drawing, closed by a pen-up return, pen ramps of
   8° cam angle overlapping the travel moves.
 
-### Capacity (default geometry, 3:1 sectors)
+### Capacity (current parameters)
 
 | Drawing | Cycle | Cam ODs (M1 / M2 / M3 / pen) |
 |---|---|---|
-| circle | 8.1 s | 84 / 95 / 53 / 114 mm |
-| heart | 8.6 s | 86 / 118 / 53 / 114 mm |
-| flower | 13.3 s | 139 / 157 / 53 / 113 mm |
+| circle | 8.1 s | 94 / 105 / 55 / 156 mm |
+| heart | 8.6 s | 122 / 163 / 125 / 156 mm |
+| flower | 13.3 s | 216 / 222 / 215 / 175 mm |
 | examples/sample.svg (14 strokes) | 32 s | infeasible in one revolution |
 
-Rule of thumb: one revolution holds roughly one or two closed shapes. Bigger
-drawings need larger cams, a slower drawing, or a multi-turn cam.
+One revolution holds roughly one or two closed shapes. The stack-aware pivot
+placement makes upper cams grow when lower cams are big.
+
+## Structural check (`structural.py`, heart, PLA)
+
+| item | running (cam drive) | 5 N push on the pen |
+|---|---|---|
+| links (upper arm, forearm, cranks) | ≤ 0.4 MPa, ≤ 140 µε, SF > 100 | ≤ 4 MPa, ≤ 1300 µε, SF ≥ 11 |
+| couplers | SF > 1000, buckling SF ≥ 88 | buckling SF ≥ 4 |
+| gears (m1.5, 8 mm, incl. spring preload) | ≤ 7 MPa root, SF ≥ 6, **no load reversal** | ≤ 29 MPa, SF ≥ 1.6 |
+| cam grooves (684 roller) | 34–38 MPa Hertz, **SF 1.2–1.3** | – |
+| pen error | 0.6 mm bending, 0.03 mm coupler stretch, 0 backlash | 7 mm elastic |
+
+The cam grooves are the weakest point (preload raises roller force): print
+cams in PETG/nylon or raise `min_wall_radius`. Camshaft needs ≈ 0.37 N·m peak.
 
 ## Layer stack
 
-See the docstring in `parts.py`. 5 mm plates, 1 mm washers, 9 layers. Every
-pin joins adjacent layers except T2 (layers 2–4, clears the upper arm), the
-bell-crank hub (5–7) and the M3 hub (gear on 6, crank on 7, keyed by a dowel).
-Follower pivot pins rise from the base plate; `drive_clearance()` checks them
-against every cam and swept follower on lower layers (the minimum is ~2 mm,
-for the pen pin against the M2 cam).
+See the docstring in `parts.py` and `LAYER` in `config.py`. Layer thicknesses
+`[9, 8, 9, 8, 6, 7, 8, 7, 6]` mm (gear layers 8 mm = gear face width; layers 0
+and 2 are tall enough for the torsion springs), 1 mm washer gaps. Every pin
+joins adjacent layers except T2 (layers 2–4), the bell-crank hub (5–7) and the
+M3 hub (gear on 6, crank on 7, dowel-keyed). `drive_clearance()` reports every
+standoff's clearance (≥ 1.7 mm for the heart).
 
 ## Hardware (BOM, approx.)
 
 | Qty | Item |
 |---|---|
-| 2 | 8 mm steel rod: shoulder axle (~70 mm), camshaft (~70 mm, with a flat) |
+| 1 | 8 mm steel rod, shoulder axle (~85 mm) **with a D-flat** (stationary, keys the spring collars) |
+| 1 | 8 mm steel rod, camshaft (~75 mm, with a flat) |
 | ~12 | 4 mm steel pins or M4 shoulder bolts (link joints, follower pivots) |
-| 4 | MR74ZZ bearings (4×7×2.5) as cam rollers + 4 mm stub pins |
+| 4 | 684ZZ bearings (4×9×4) as cam rollers + 4 mm stub pins |
+| 3 | music-wire torsion springs per `cad/springs.md` (≈ 1.1–1.4 mm wire, ~20 mm OD) |
 | 2 | 3 mm dowels (bell-crank key, M3 hub key) |
 | — | 8 mm and 4 mm washers (1 mm) between layers, e-clips/collars |
 | 1 | M3 set screw (pen clamp) |
-| 1 | small DC gear motor + worm/wormwheel (camshaft ≈ 4–8 rpm) |
+| 1 | small DC gear motor + worm/wormwheel (camshaft ≈ 4–8 rpm, ≈ 0.4 N·m) |
 | 1 | Bowden cable + light spring (pen lift) |
 
 ## Printing notes
 
-* PLA/PETG, 0.2 mm layers, 4 perimeters around bores, 40 %+ infill for gears and cams.
-* Print every part flat (as exported). Ream 4.3/8.25 mm bores; adjust `PIN`,
-  `AXLE`, `BACKLASH` in `parts.py` for your printer.
-* Gears are module 1 – fine for FDM with a 0.4 mm nozzle; check mesh with a test print of a hub + follower first.
+* PLA for links; PETG or nylon recommended for cams and gears. 0.2 mm layers,
+  4 perimeters around bores, 40 %+ infill for gears and cams.
+* Print every part flat (as exported). Tune `pin_bore`, `axle_bore`,
+  `backlash`, `groove_clearance` in `params.toml` for your printer; print one
+  hub + follower first to check the mesh.
 
 ## Not done yet
 

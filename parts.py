@@ -1,12 +1,13 @@
 """
 parts.py - parametric 3D-printable parts for the drawing arm + cam drive (CadQuery).
 
-    python parts.py [shape|file.svg]     -> cad/stl/*.stl, cad/assembly.step, cad/preview.png
+    python parts.py [shape|file.svg]   -> cad/stl/*.stl, cad/assembly.step,
+                                          cad/preview.png, cad/cams.png, cad/springs.md
 
-Everything is generated from Geometry (arm_kinematics) and the CamSet
-(cam_drive), so changing a link length or the drawing regenerates the parts.
+All dimensions come from params.toml ([parts], [drive], [arm]); geometry from
+Geometry (arm_kinematics) and the CamSet (cam_drive).
 
-Layer stack (each plate T thick, layer pitch P = T + washer gap), bottom -> top:
+Layer stack, bottom -> top (thickness per layer from [parts].layer_thickness):
 
   layer  arm side                          drive side (behind the shoulder)
   -----  --------------------------------  ---------------------------------
@@ -16,18 +17,19 @@ Layer stack (each plate T thick, layer pitch P = T + washer gap), bottom -> top:
    3     upper arm (hub on S axle)         follower M1
    4     forearm (tail T2, E, W)
    5     bell-crank arm B, hand + crank    cam M3
-   6     coupler B  (B1-B2), M3 gear (hub) follower M3
+   6     coupler B, M3 gear (hub)          follower M3
    7     bell-crank arm A, M3 crank (hub)  cam pen-lift
    8     coupler A  (A1-A2)                follower pen-lift (cable lever)
-  base plate below layer 0 carries the S axle, camshaft and follower pivots.
+  base plate below layer 0: S axle (D-flat, fixed), camshaft, follower standoffs.
+  torsion springs + keyed collars fill the shoulder-axle gaps on layers 0, 2, 4-5.
 
 Every pin joins ADJACENT layers except T2 (layers 2-4, clears the upper arm
-by >= 20 mm thanks to the 20 deg elbow limit), and the bell-crank hub that
-spans 5-7 (keyed to the arm-A plate with a dowel).  The M3 hub is split the
-same way: gear sector on layer 6, crank on layer 7, keyed by a dowel, so the
-follower M3 sector never meets the crank arm.
-Hardware: 8 mm rod (shoulder axle, camshaft), 4 mm pins/shoulder bolts,
-MR74ZZ bearings (4x7x2.5) as cam rollers, M3 set screw for the pen.
+thanks to the 20 deg elbow limit), the bell-crank hub (5-7, dowel-keyed to the
+arm-A plate) and the M3 hub (gear on 6, crank on 7, dowel-keyed).
+Anti-backlash: a torsion spring around the fixed shoulder axle under each hub
+(keyed collar + leg hole in the hub, see springs.py) holds a hub torque larger
+than the arm ever needs ([drive.preload]), so gear and cam flanks never change
+side.
 """
 import math
 import os
@@ -36,25 +38,29 @@ import sys
 import numpy as np
 import cadquery as cq
 
-from arm_kinematics import Geometry, Linkage
-from cam_drive import DriveParams, design_cams, plan_for_cams, report, plot_cams
+from arm_kinematics import Geometry, Linkage, paper_motor_range
+from cam_drive import design_cams, plan_for_cams, report, plot_cams
+import springs as spr
+from config import CFG, PAPER, LAYER
 
-T = 5.0            # plate thickness
-GAP = 1.0          # washer gap
-P = T + GAP        # layer pitch
-PIN = 4.3          # 4 mm pin clearance bore
-AXLE = 8.25        # 8 mm rod clearance bore
-FIT_PIN = 3.95     # press fit for 4 mm pins (roller studs)
-W_LINK = 14.0      # link width
-BACKLASH = 0.15    # mm, gear tooth thinning
+PC, PR, DR = CFG["parts"], CFG["parts"]["radius"], CFG["drive"]
+GAP = PC["gap"]
+TH = list(PC["layer_thickness"])
+PIN, AXLE, FIT_PIN = PC["pin_bore"], PC["axle_bore"], PC["fit_pin"]
+BACKLASH = PC["backlash"]
+STANDOFF_R = PC["standoff_od"] / 2
+SPACER_R = PC["spacer_od"] / 2
 
-LAYER = dict(cam_M2=0, crank_M2=1, follow_M2=1, coupler_E=2, cam_M1=2, upper_arm=3, follow_M1=3,
-             forearm=4, bell_B=5, hand=5, cam_M3=5, coupler_B=6, gear_M3=6, follow_M3=6,
-             bell_A=7, crank_M3=7, cam_pen=7, coupler_A=8, follow_pen=8)
+HUB_LAYERS = (1, 3, 6)                       # layers with a gear on the shoulder axle
+CAM_LAYERS = (0, 2, 5, 7)
 
 
 def z0(layer):
-    return layer * P
+    return sum(TH[i] + GAP for i in range(layer))
+
+
+def tk(layer):
+    return TH[layer]
 
 
 # ------------------------------------------------------------------ 2D helpers
@@ -67,28 +73,32 @@ def ang(a, b):
     return math.atan2(d[1], d[0])
 
 
-def slot_link(a, b, ra, rb, t=T):
+def upol(a):
+    return np.array([math.cos(a), math.sin(a)])
+
+
+def slot_link(a, b, ra, rb, t):
     """Stadium/hull of two circles (a link body)."""
     a, b = v2(a), v2(b)
     d = b - a
-    L = float(np.hypot(*d))
     th = math.atan2(d[1], d[0])
-    pts = []
-    for k in np.linspace(math.pi / 2, 3 * math.pi / 2, 24):
-        pts.append(a + ra * np.array([math.cos(th + k), math.sin(th + k)]))
-    for k in np.linspace(-math.pi / 2, math.pi / 2, 24):
-        pts.append(b + rb * np.array([math.cos(th + k), math.sin(th + k)]))
+    pts = [a + ra * upol(th + k) for k in np.linspace(math.pi / 2, 3 * math.pi / 2, 24)]
+    pts += [b + rb * upol(th + k) for k in np.linspace(-math.pi / 2, math.pi / 2, 24)]
     return cq.Workplane("XY").polyline([tuple(p) for p in pts]).close().extrude(t)
 
 
-def holes(wp, pts, d, t=T):
+def holes(wp, pts, d, t):
     for p in pts:
         wp = wp.cut(cq.Workplane("XY").center(*p).circle(d / 2).extrude(t))
     return wp
 
 
-def disc(c, r, t=T):
+def disc(c, r, t):
     return cq.Workplane("XY").center(*c).circle(r).extrude(t)
+
+
+def tube(c, r_out, r_in, t):
+    return disc(c, r_out, t).cut(disc(c, r_in, t))
 
 
 # ------------------------------------------------------------------ gears
@@ -120,7 +130,7 @@ def gear_sector_pts(center, m, z, a_center, half_span, gap_on_center=False, inne
     n = int((half_span + abs(a_center - anchor)) / pitch) + 2
     centers = [anchor + off + k * pitch for k in range(-n, n + 1)]
     centers = [a for a in centers if abs(a - a_center) <= half_span + 1e-9]
-    pol = lambda r, a: tuple(c + r * np.array([math.cos(a), math.sin(a)]))
+    pol = lambda r, a: tuple(c + r * upol(a))
     pts = []
     a_start = centers[0] - pitch / 2
     pts.append(pol(inner_r, a_start))
@@ -134,31 +144,111 @@ def gear_sector_pts(center, m, z, a_center, half_span, gap_on_center=False, inne
     a_end = centers[-1] + pitch / 2
     pts.append(pol(rf, a_end))
     pts.append(pol(inner_r, a_end))
-    # inner arc back
     for a in np.linspace(a_end, a_start, 12)[1:-1]:
         pts.append(pol(inner_r, a))
     return pts
 
 
-def gear_sector(center, m, z, a_center, half_span, gap_on_center=False, inner_r=None, t=T, anchor=None):
+def gear_sector(center, m, z, a_center, half_span, t, gap_on_center=False, inner_r=None, anchor=None):
     pts = gear_sector_pts(center, m, z, a_center, half_span, gap_on_center, inner_r, anchor)
     return cq.Workplane("XY").polyline(pts).close().extrude(t)
 
 
-def paper_motor_range(g):
-    """Motor angle range needed to reach the whole paper (any drawing)."""
-    from arm_kinematics import solve_ik
-    from arm_linkage import PAPER
-    xs = np.linspace(PAPER[0], PAPER[2], 14)
-    ys = np.linspace(PAPER[1], PAPER[3], 12)
-    M = []
-    for x in xs:
-        for y in ys:
-            s = solve_ik(g, (x, y))
-            if s:
-                M.append(s["inputs"])
-    M = np.unwrap(np.array(M), axis=0)
-    return list(zip(M.min(0), M.max(0)))
+# ================================================== drive layout & clearances
+def seg_dist(p, a, b):
+    ab = b - a
+    t_ = np.clip(np.dot(p - a, ab) / max(np.dot(ab, ab), 1e-12), 0, 1)
+    return float(np.hypot(*(p - (a + t_ * ab))))
+
+
+def seg_seg_dist(a, b, c, d, n=12):
+    return min(min(seg_dist(a + (b - a) * k / n, c, d) for k in range(n + 1)),
+               min(seg_dist(c + (d - c) * k / n, a, b) for k in range(n + 1)))
+
+
+class Layout:
+    """Plan-view obstacles per layer in the drive area, for checking vertical
+    standoffs (which pass through every lower layer)."""
+
+    def __init__(self, g, cs, M_paper):
+        self.g, self.cs, self.p = g, cs, cs.params
+        self.M_paper = M_paper
+        self.items = []                         # (layer, name, fn(point)->clearance, seg_fn)
+        p = self.p
+        names = ["M1", "M2", "M3", "pen"]
+        self.designs = [(nm, d) for nm, d in zip(names, cs.axes + [cs.pen_axis]) if d is not None]
+        for nm, d in self.designs:
+            O, R = cs.O, d["outer"]
+            self.items.append((LAYER["cam_" + nm], "cam " + nm, lambda q, O=O, R=R: np.hypot(*(q - O)) - R))
+            self.items.append((LAYER["follow_" + nm], "follower " + nm, self._follower_fn(nm, d)))
+        # shoulder axle hardware
+        r_tip = p.module * p.z_hub / 2 + p.module
+        for lay in range(len(TH)):
+            r = r_tip if lay in HUB_LAYERS else max(SPACER_R, DR["preload"].get("max_od", 21.0) / 2 + 1)
+            self.items.append((lay, "shoulder hub/spacer", lambda q, r=r: np.hypot(*q) - r))
+            if lay not in CAM_LAYERS:
+                self.items.append((lay, "camshaft spacer", lambda q: np.hypot(*(q - cs.O)) - SPACER_R))
+        # arm-side sweeps near the shoulder (cranks/couplers over the whole paper)
+        from arm_kinematics import solve_ik
+        lk = Linkage(g)
+        poses = [lk.solve(*solve_ik(g, (x, y))["inputs"])
+                 for x in np.linspace(PAPER[0], PAPER[2], 7) for y in np.linspace(PAPER[1], PAPER[3], 5)]
+        segs = {1: [], 2: [], 7: [], 8: []}
+        for st in poses:
+            segs[1].append((v2(st["S"]), v2(st["C2"]), PR["crank_M2"][0]))
+            segs[2].append((v2(st["C2"]), v2(st["T2"]), PR["coupler_E"]))
+            segs[7].append((v2(st["S"]), v2(st["A1"]), PR["crank_M3"][0]))
+            segs[8].append((v2(st["A1"]), v2(st["A2"]), PR["coupler_A"]))
+        for lay, ss in segs.items():
+            self.items.append((lay, "arm sweep", lambda q, ss=ss: min(seg_dist(q, a, b) - r for a, b, r in ss)))
+
+    def _follower_fn(self, nm, d):
+        p = self.p
+        idx = np.linspace(0, len(d["psi"]) - 1, 48).astype(int)
+        F = d["F"]
+        geared = nm != "pen"
+        rs = p.module * d["zf"] / 2 if geared else 0
+        a_m = ang(F, np.zeros(2))
+        half = np.ptp(d["psi"]) / 2 + math.radians(8)
+
+        def fn(q):
+            best = 1e9
+            for k in idx:
+                R = F + d["l"] * upol(d["psi"][k])
+                best = min(best, seg_dist(q, F, R) - PR["follower_arm"][0])
+            if geared:
+                dd = np.hypot(*(q - F))
+                aq = ang(F, q)
+                if abs((aq - a_m + math.pi) % (2 * math.pi) - math.pi) < half:
+                    best = min(best, abs(dd - (rs - 2)) - (p.module * 1.5 + 5))
+            return best
+        return fn
+
+    def column_clearance(self, q, top_layer, r, exclude=()):
+        """Vertical column of radius r at q from the base up to (not incl.) top_layer."""
+        out = []
+        for lay, name, fn in self.items:
+            if lay < top_layer and name not in exclude:
+                out.append((fn(q) - r, name, lay))
+        return min(out) if out else (1e9, "", -1)
+
+    def segment_clearance(self, a, b, layer, r, exclude=()):
+        out = []
+        for lay, name, fn in self.items:
+            if lay == layer and name not in exclude:
+                ts = np.linspace(0, 1, 9)
+                out.append((min(fn(a + (b - a) * t_) for t_ in ts) - r, name))
+        return min(out) if out else (1e9, "")
+
+
+def drive_clearance(layout):
+    """Clearance of every follower standoff (columns rising from the base
+    plate) against everything on the layers they pass."""
+    res = []
+    for nm, d in layout.designs:
+        c, who, lay = layout.column_clearance(d["F"], LAYER["follow_" + nm], STANDOFF_R)
+        res.append((f"standoff {nm}", who, lay, c))
+    return res
 
 
 # ================================================================== parts
@@ -170,177 +260,214 @@ class Builder:
         self.M_paper = paper_motor_range(g)        # gears cover the whole paper (reusable)
         self.st = Linkage(g).solve(*M0)
         self.M0 = M0
+        self.layout = Layout(g, cs, self.M_paper)
+        self.springs = spr.design(self.M_paper)        # torsion springs on the shoulder axle
         self.parts = {}                            # name -> (solid in world, layer, colour)
 
-    def add(self, name, solid, layer, color):
-        self.parts[name] = (solid.translate((0, 0, z0(layer))), layer, color)
+    def add(self, name, solid, layer, color, z=None):
+        self.parts[name] = (solid.translate((0, 0, z0(layer) if z is None else z)), layer, color)
 
     # ---------------------------------------------------------- arm
-    def hub_sector(self, axis_idx, solid):
-        """Add the hub gear sector that meshes with follower axis_idx."""
+    def hub_sector(self, axis_idx, solid, t):
         des = self.cs.axes[axis_idx]
         S = np.zeros(2)
         a_mesh = ang(S, des["F"])
         lo, hi = self.M_paper[axis_idx]
         lo, hi = min(lo, self.cs.motors[:, axis_idx].min()), max(hi, self.cs.motors[:, axis_idx].max())
         span = (hi - lo) / 2 + math.radians(12)
-        # world angle of hub material at the mesh = a_mesh - (M - M0)
-        dM = np.array([lo, hi]) - self.M0[axis_idx]
+        dM = np.array([lo, hi]) - self.M0[axis_idx]           # hub material at mesh = a_mesh - dM
         centre = a_mesh - (dM.max() + dM.min()) / 2
-        sec = gear_sector(S, self.p.module, self.p.z_hub, centre, span, gap_on_center=False,
+        sec = gear_sector(S, self.p.module, self.p.z_hub, centre, span, t, gap_on_center=False,
                           inner_r=4.0, anchor=a_mesh)
-        # tooth must sit centred on the mesh line in the assembled pose
         return solid.union(sec)
+
+    def leg_hole(self, solid, axis, t):
+        """Hole for the torsion-spring leg, on the side away from the gear mesh."""
+        sp = self.springs[axis]
+        k = ["M1", "M2", "M3"].index(axis)
+        a = ang(np.zeros(2), self.cs.axes[k]["F"]) + math.pi if self.cs.axes[k] else 0.0
+        r = min(sp["D"] / 2, PR["hub"] - sp["d"] / 2 - 1.0)
+        return holes(solid, [r * upol(a)], sp["d"] + 0.4, t)
 
     def build_arm(self):
         g, st = self.g, self.st
         S, E, W, Pp = (v2(st[k]) for k in ("S", "E", "W", "P"))
+        L = LAYER
 
-        crank2 = slot_link(S, st["C2"], 10, 7).union(disc(S, 10))
-        crank2 = self.hub_sector(1, crank2) if self.cs.axes[1] else crank2
-        crank2 = holes(crank2, [S], AXLE)
-        crank2 = holes(crank2, [st["C2"]], PIN)
-        self.add("crank_M2", crank2, LAYER["crank_M2"], "#1aa3a3")
+        t = tk(L["crank_M2"])
+        r0, r1 = PR["crank_M2"]
+        crank2 = slot_link(S, st["C2"], r0, r1, t).union(disc(S, PR["hub"], t))
+        crank2 = self.hub_sector(1, crank2, t) if self.cs.axes[1] else crank2
+        crank2 = holes(holes(crank2, [S], AXLE, t), [st["C2"]], PIN, t)
+        crank2 = self.leg_hole(crank2, "M2", t)
+        self.add("crank_M2", crank2, L["crank_M2"], "#1aa3a3")
 
-        cE = holes(slot_link(st["C2"], st["T2"], 6, 6), [st["C2"], st["T2"]], PIN)
-        self.add("coupler_E", cE, LAYER["coupler_E"], "#7fd6d6")
+        t = tk(L["coupler_E"])
+        r = PR["coupler_E"]
+        self.add("coupler_E", holes(slot_link(st["C2"], st["T2"], r, r, t), [st["C2"], st["T2"]], PIN, t),
+                 L["coupler_E"], "#7fd6d6")
 
-        ua = slot_link(S, E, 11, 9).union(disc(S, 11))
-        ua = self.hub_sector(0, ua) if self.cs.axes[0] else ua
-        ua = holes(ua, [S], AXLE)
-        ua = holes(ua, [E], PIN)
-        # lightening slot
-        L = np.hypot(*(E - S))
-        u = (E - S) / L
-        ua = ua.cut(slot_link(S + u * 28, E - u * 28, 3, 3))
-        self.add("upper_arm", ua, LAYER["upper_arm"], "#2f6db5")
+        t = tk(L["upper_arm"])
+        r0, r1 = PR["upper_arm"]
+        ua = slot_link(S, E, r0, r1, t).union(disc(S, r0, t))
+        ua = self.hub_sector(0, ua, t) if self.cs.axes[0] else ua
+        ua = holes(holes(ua, [S], AXLE, t), [E], PIN, t)
+        ua = self.leg_hole(ua, "M1", t)
+        u = (E - S) / np.hypot(*(E - S))
+        sw, si = PR["upper_arm_slot"]
+        ua = ua.cut(slot_link(S + u * si, E - u * si, sw, sw, t))
+        self.add("upper_arm", ua, L["upper_arm"], "#2f6db5")
 
-        fa = slot_link(st["T2"], E, 7, 9).union(slot_link(E, W, 9, 7.5))
-        fa = holes(fa, [st["T2"], E, W], PIN)
+        t = tk(L["forearm"])
+        rT, rE, rW = PR["forearm"]
+        fa = slot_link(st["T2"], E, rT, rE, t).union(slot_link(E, W, rE, rW, t))
+        fa = holes(fa, [st["T2"], E, W], PIN, t)
         u = (W - E) / np.hypot(*(W - E))
-        fa = fa.cut(slot_link(E + u * 26, W - u * 26, 2.5, 2.5))
-        self.add("forearm", fa, LAYER["forearm"], "#2f9e57")
+        sw, si = PR["forearm_slot"]
+        fa = fa.cut(slot_link(E + u * si, W - u * si, sw, sw, t))
+        self.add("forearm", fa, L["forearm"], "#2f9e57")
 
-        # bell-crank: lower plate (arm B) with hub boss up through layer 6,
-        # upper plate (arm A) keyed by a 3 mm dowel
-        dow = E + 6.5 * np.array([math.cos(ang(E, st["A2"]) + 1.0), math.sin(ang(E, st["A2"]) + 1.0)])
-        bl = slot_link(E, st["B1"], 9, 6).union(disc(E, 9, 2 * P))
-        bl = holes(bl, [E, st["B1"]], PIN, 2 * P)
-        bl = holes(bl, [dow], 2.9, 2 * P)
-        self.add("bell_crank_lower", bl, LAYER["bell_B"], "#8e55c9")
-        bu = slot_link(E, st["A2"], 9, 6)
-        bu = holes(bu, [E, st["A2"]], PIN)
-        bu = holes(bu, [dow], 3.1)
-        self.add("bell_crank_upper", bu, LAYER["bell_A"], "#8e55c9")
+        # bell-crank: lower plate (arm B) + hub boss up to layer 7, upper plate (arm A) dowel-keyed
+        rb0, rb1 = PR["bell"]
+        h_boss = z0(L["bell_A"]) - z0(L["bell_B"])
+        dow = E + 6.5 * upol(ang(E, st["A2"]) + 1.0)
+        t5 = tk(L["bell_B"])
+        bl = slot_link(E, st["B1"], rb0, rb1, t5).union(disc(E, rb0, h_boss))
+        bl = holes(holes(bl, [E, st["B1"]], PIN, h_boss), [dow], PC["dowel_fit"], h_boss)
+        self.add("bell_crank_lower", bl, L["bell_B"], "#8e55c9")
+        t7 = tk(L["bell_A"])
+        bu = holes(holes(slot_link(E, st["A2"], rb0, rb1, t7), [E, st["A2"]], PIN, t7), [dow], PC["dowel_free"], t7)
+        self.add("bell_crank_upper", bu, L["bell_A"], "#8e55c9")
 
-        cB = holes(slot_link(st["B1"], st["B2"], 5.5, 5.5), [st["B1"], st["B2"]], PIN)
-        self.add("coupler_B", cB, LAYER["coupler_B"], "#c7a8ea")
+        t = tk(L["coupler_B"])
+        r = PR["coupler_B"]
+        self.add("coupler_B", holes(slot_link(st["B1"], st["B2"], r, r, t), [st["B1"], st["B2"]], PIN, t),
+                 L["coupler_B"], "#c7a8ea")
 
-        dow3 = S + 6.5 * np.array([math.cos(ang(S, st["A1"])), math.sin(ang(S, st["A1"]))])
-        crank3 = slot_link(S, st["A1"], 10, 6).union(disc(S, 10))
-        crank3 = holes(crank3, [S], AXLE)
-        crank3 = holes(crank3, [st["A1"]], PIN)
-        crank3 = holes(crank3, [dow3], 3.1)
-        self.add("crank_M3", crank3, LAYER["crank_M3"], "#8e55c9")
-        gear3 = disc(S, 10)
-        gear3 = self.hub_sector(2, gear3) if self.cs.axes[2] else gear3
-        gear3 = holes(gear3, [S], AXLE)
-        gear3 = holes(gear3, [dow3], 2.9)
-        self.add("gear_M3", gear3, LAYER["gear_M3"], "#8e55c9")
+        # M3: crank (layer 7) + gear (layer 6, boss up to touch the crank), dowel-keyed
+        dow3 = S + 6.5 * upol(ang(S, st["A1"]))
+        t = tk(L["crank_M3"])
+        r0, r1 = PR["crank_M3"]
+        crank3 = slot_link(S, st["A1"], r0, r1, t).union(disc(S, PR["hub"], t))
+        crank3 = holes(holes(holes(crank3, [S], AXLE, t), [st["A1"]], PIN, t), [dow3], PC["dowel_free"], t)
+        self.add("crank_M3", crank3, L["crank_M3"], "#8e55c9")
+        t6 = tk(L["gear_M3"])
+        h3 = z0(L["crank_M3"]) - z0(L["gear_M3"])
+        gear3 = disc(S, PR["hub"], h3)
+        gear3 = self.hub_sector(2, gear3, t6) if self.cs.axes[2] else gear3
+        gear3 = holes(holes(gear3, [S], AXLE, h3), [dow3], PC["dowel_fit"], h3)
+        gear3 = self.leg_hole(gear3, "M3", h3)
+        self.add("gear_M3", gear3, L["gear_M3"], "#8e55c9")
 
-        cA = holes(slot_link(st["A1"], st["A2"], 5.5, 5.5), [st["A1"], st["A2"]], PIN)
-        self.add("coupler_A", cA, LAYER["coupler_A"], "#c7a8ea")
+        t = tk(L["coupler_A"])
+        r = PR["coupler_A"]
+        self.add("coupler_A", holes(slot_link(st["A1"], st["A2"], r, r, t), [st["A1"], st["A2"]], PIN, t),
+                 L["coupler_A"], "#c7a8ea")
 
         # hand: wrist boss + crank arm to B2 + pen holder at P (pen points down)
-        hand = slot_link(W, Pp, 8, 9).union(slot_link(W, st["B2"], 8, 6))
-        hand = hand.union(disc(Pp, 9, T + 6))                       # taller pen collar
-        hand = holes(hand, [W, st["B2"]], PIN)
-        hand = holes(hand, [Pp], 10.4, T + 6)                       # ~10 mm marker
+        t = tk(L["hand"])
+        h0, h1 = PR["hand"]
+        c0, c1 = PR["hand_crank"]
+        hc = t + PC["pen_collar_extra"]
+        hand = slot_link(W, Pp, h0, h1, t).union(slot_link(W, st["B2"], c0, c1, t))
+        hand = hand.union(disc(Pp, h1, hc))
+        hand = holes(hand, [W, st["B2"]], PIN, t)
+        hand = holes(hand, [Pp], PC["pen_bore"], hc)
         u = (Pp - W) / np.hypot(*(Pp - W))
-        setscrew = (cq.Workplane("YZ").circle(1.3).extrude(12)
+        setscrew = (cq.Workplane("YZ").circle(PC["setscrew_d"] / 2).extrude(h1 + 3)
                     .rotate((0, 0, 0), (0, 0, 1), math.degrees(math.atan2(u[1], u[0])))
-                    .translate((Pp[0], Pp[1], T / 2 + 3)))
-        hand = hand.cut(setscrew)
-        self.add("hand", hand, LAYER["hand"], "#e08a1e")
+                    .translate((Pp[0], Pp[1], hc / 2)))
+        self.add("hand", hand.cut(setscrew), L["hand"], "#e08a1e")
 
-        # shoulder axle spacers (fill layers without a hub)
-        for name, lay, n in (("spacer_S_2", 2, 1), ("spacer_S_45", 4, 2)):
-            sp = disc(S, 7, n * P - GAP).cut(disc(S, AXLE / 2, n * P))
-            self.add(name, sp.translate((0, 0, -GAP / 2 + GAP / 2)), lay, "#bbbbbb")
+        # keyed spring collars on the fixed shoulder axle (one torsion spring each)
+        gaps = [("M2", -GAP, z0(1)), ("M1", z0(1) + tk(1), z0(3)), ("M3", z0(3) + tk(3), z0(6))]
+        for nm, za, zb in gaps:
+            sp = self.springs[nm]
+            h = zb - za
+            r_out = sp["ID"] / 2 - 0.4                                  # spring slides over it
+            col = disc(S, r_out, h)
+            flat = AXLE / 2 - 0.8                                       # D-flat on the axle
+            col = col.cut(disc(S, AXLE / 2, h).cut(cq.Workplane("XY").center(flat + 5, 0).rect(10, 10).extrude(h)))
+            col = col.cut(cq.Workplane("XY").center(-r_out, 0).rect(2.2, sp["d"] + 0.6).extrude(h))  # leg slot
+            # flange under the spring (bears on the hub/base below)
+            col = col.union(tube(S, sp["OD"] / 2 + 1.0, AXLE / 2, 1.0).cut(
+                cq.Workplane("XY").center(flat + 5, 0).rect(10, 10).extrude(1.0)))
+            self.add(f"spring_collar_{nm}", col, -1, "#bbbbbb", z=za)
 
     # ---------------------------------------------------------- drive
     def build_drive(self):
         cs, p = self.cs, self.p
         O = cs.O
-        lay = {0: ("M1", "cam_M1", "follow_M1"), 1: ("M2", "cam_M2", "follow_M2"),
-               2: ("M3", "cam_M3", "follow_M3")}
-        designs = [(k, cs.axes[k]) + lay[k] for k in range(3)] + [(3, cs.pen_axis, "pen", "cam_pen", "follow_pen")]
-        for k, des, nm, cam_l, fol_l in designs:
-            if des is None:
-                continue
-            # ---- cam (groove on top face), D-flat bore, timing notch at theta = 0
+        rr = p.roller_r + PC["groove_clearance"] / 2
+        depth = p.roller_w + 0.5
+        for nm, des in self.layout.designs:
+            k = ["M1", "M2", "M3", "pen"].index(nm)
+            cl, fl = LAYER["cam_" + nm], LAYER["follow_" + nm]
+            tc, tf = tk(cl), tk(fl)
+            # ---- cam: groove on the top face, D-flat bore, timing notch at theta = 0
             pc = des["pitch"]
             d = np.gradient(pc, axis=0)
             nrm = np.stack([-d[:, 1], d[:, 0]], 1) / np.hypot(*d.T)[:, None]
-            outer_w = pc + p.roller_r * nrm
-            inner_w = pc - p.roller_r * nrm
-            cam = disc((0, 0), des["outer"])
-            groove = (cq.Workplane("XY").polyline([tuple(q) for q in outer_w[::2]]).close().extrude(3.2)
-                      .cut(cq.Workplane("XY").polyline([tuple(q) for q in inner_w[::2]]).close().extrude(3.2)))
-            cam = cam.cut(groove.translate((0, 0, T - 3.2)))
-            bore = disc((0, 0), AXLE / 2).cut(cq.Workplane("XY").center(AXLE / 2 - 0.6 + 2, 0).rect(4, 10).extrude(T))
-            cam = cam.cut(bore)
-            cam = cam.cut(cq.Workplane("XY").center(des["outer"], 0).rect(3, 3).extrude(T))   # timing notch
-            # lightening holes inside the groove
-            r_hole = (des["inner"] - 7) / 2
+            outer_w, inner_w = pc + rr * nrm, pc - rr * nrm
+            cam = disc((0, 0), des["outer"], tc)
+            groove = (cq.Workplane("XY").polyline([tuple(q) for q in outer_w[::2]]).close().extrude(depth)
+                      .cut(cq.Workplane("XY").polyline([tuple(q) for q in inner_w[::2]]).close().extrude(depth)))
+            cam = cam.cut(groove.translate((0, 0, tc - depth)))
+            cam = cam.cut(disc((0, 0), AXLE / 2, tc).cut(
+                cq.Workplane("XY").center(AXLE / 2 + 1.4, 0).rect(4, 10).extrude(tc)))
+            cam = cam.cut(cq.Workplane("XY").center(des["outer"], 0).rect(3, 3).extrude(tc))
+            r_hole = (des["inner"] - 8) / 2
             if r_hole > 4:
-                for a in np.arange(0, 360, 90) + 45:
-                    cpt = (7 + r_hole) * np.array([math.cos(math.radians(a)), math.sin(math.radians(a))])
-                    cam = cam.cut(disc(cpt, r_hole * 0.8))
-            self.add(f"cam_{nm}", cam.translate((O[0], O[1], 0)), LAYER[cam_l], "#666666")
+                for a in np.radians(np.arange(45, 360, 90)):
+                    cam = cam.cut(disc((8 + r_hole) * upol(a), r_hole * 0.8, tc))
+            self.add(f"cam_{nm}", cam.translate((O[0], O[1], 0)), cl, "#666666")
 
             # ---- follower: pivot boss, arm to roller, sector gear toward S
             F = des["F"]
             psi0 = des["psi"][0]
-            R0 = F + des["l"] * np.array([math.cos(psi0), math.sin(psi0)])
-            fol = slot_link(F, R0, 7, 6)
-            if k < 3:
+            R0 = F + des["l"] * upol(psi0)
+            ra0, ra1 = PR["follower_arm"]
+            fol = slot_link(F, R0, ra0, ra1, tf)
+            if nm != "pen":
                 S = np.zeros(2)
                 a_mesh = ang(F, S)
                 lo, hi = self.M_paper[k]
-                lo = min(lo, cs.motors[:, k].min())
-                hi = max(hi, cs.motors[:, k].max())
+                lo, hi = min(lo, cs.motors[:, k].min()), max(hi, cs.motors[:, k].max())
                 dpsi = -(np.array([lo, hi]) - self.M0[k]) / des["G"]
                 span = abs(dpsi[1] - dpsi[0]) / 2 + math.radians(6)
                 centre = a_mesh - (dpsi.max() + dpsi.min()) / 2
                 rs = p.module * des["zf"] / 2
-                # spoke from pivot to sector (stops short of the mesh)
-                fol = fol.union(slot_link(F, F + (rs - 8) * np.array([math.cos(centre), math.sin(centre)]), 7, 4))
-                fol = fol.union(gear_sector(F, p.module, des["zf"], centre, span, gap_on_center=True,
-                                            inner_r=rs - 5, anchor=a_mesh))
+                s0, s1 = PR["follower_spoke"]
+                fol = fol.union(slot_link(F, F + (rs - 3 * p.module - 2) * upol(centre), s0, s1, tf))
+                fol = fol.union(gear_sector(F, p.module, des["zf"], centre, span, tf, gap_on_center=True,
+                                            inner_r=rs - 3 * p.module - 2, anchor=a_mesh))
             else:
-                # cable lever: extend beyond the pivot, cable hole at the end
-                tip = F - 45 * np.array([math.cos(psi0), math.sin(psi0)])
-                fol = fol.union(slot_link(F, tip, 7, 5))
-                fol = holes(fol, [tip], 2.0)
-            fol = holes(fol, [F], PIN)
-            fol = holes(fol, [R0], FIT_PIN)                          # roller stud (pin + MR74 below)
-            self.add(f"follower_{nm}", fol, LAYER[fol_l], "#9e9e9e")
+                tip = F - 45 * upol(psi0)                                     # cable lever
+                fol = holes(fol.union(slot_link(F, tip, ra0, 5, tf)), [tip], 2.0, tf)
+            fol = holes(holes(fol, [F], PIN, tf), [R0], FIT_PIN, tf)          # pivot + roller stud
+            self.add(f"follower_{nm}", fol, fl, "#9e9e9e")
+            # standoff under the follower pivot
+            self.add(f"standoff_{nm}", tube(F, STANDOFF_R, PIN / 2, z0(fl) - GAP + GAP), -1, "#bcaaa4", z=-GAP)
+
+        # camshaft spacers between the cams
+        cams = sorted(LAYER[f"cam_{nm}"] for nm, _ in self.layout.designs)
+        za = -GAP
+        for i, lay in enumerate(cams):
+            if z0(lay) - za > 0.1:
+                self.add(f"spacer_O_{i}", tube(O, SPACER_R, AXLE / 2, z0(lay) - za), -1, "#bbbbbb", z=za)
+            za = z0(lay) + tk(lay)
 
     def build_base(self):
         cs = self.cs
-        pts = [np.zeros(2), cs.O] + [a["F"] for a in cs.axes + [cs.pen_axis] if a is not None]
-        hull = []
-        for q in pts:
-            for a in np.linspace(0, 2 * math.pi, 16, endpoint=False):
-                hull.append(q + 16 * np.array([math.cos(a), math.sin(a)]))
-        hull = np.array(hull)
+        pts = [np.zeros(2), cs.O] + [d["F"] for _, d in self.layout.designs]
+        hull = np.array([q + 16 * upol(a) for q in pts for a in np.linspace(0, 2 * math.pi, 16, endpoint=False)])
         from scipy.spatial import ConvexHull
         h = hull[ConvexHull(hull).vertices]
-        base = cq.Workplane("XY").polyline([tuple(q) for q in h]).close().extrude(6)
-        base = holes(base, [np.zeros(2), cs.O], AXLE, 6)
-        base = holes(base, [a["F"] for a in cs.axes + [cs.pen_axis] if a is not None], PIN, 6)
-        self.parts["base_plate"] = (base.translate((0, 0, -6 - GAP)), -1, "#d7ccc8")
+        bt = PC["base_thickness"]
+        base = cq.Workplane("XY").polyline([tuple(q) for q in h]).close().extrude(bt)
+        base = holes(base, [np.zeros(2), cs.O], AXLE, bt)
+        base = holes(base, [d["F"] for _, d in self.layout.designs], PIN, bt)
+        self.parts["base_plate"] = (base.translate((0, 0, -bt - GAP)), -1, "#d7ccc8")
 
     def build(self):
         self.build_arm()
@@ -349,54 +476,10 @@ class Builder:
         return self.parts
 
 
-# ============================================================ clearance check
-def drive_clearance(cs, p=None, n_pose=72):
-    """Each follower pivot pin rises from the base plate through every lower
-    layer.  Check it against the cams (static discs) and the swept followers
-    (approximated as pivot->roller bars + sector arcs) on those layers.
-    Returns list of (pin, obstacle, clearance_mm); negative = collision."""
-    p = cs.params
-    items = []
-    names = ["M1", "M2", "M3", "pen"]
-    des = cs.axes + [cs.pen_axis]
-    for i, (nm, d) in enumerate(zip(names, des)):
-        if d is not None:
-            items.append((nm, d, LAYER["follow_" + nm], LAYER["cam_" + nm]))
-    out = []
-    for nm, d, lay, _ in items:
-        pin = d["F"]
-        for nm2, d2, lay2, cam_lay2 in items:
-            if nm2 == nm:
-                continue
-            if cam_lay2 < lay:                     # cam disc below this follower
-                c = np.hypot(*(pin - cs.O)) - d2["outer"] - 3.0
-                out.append((nm, "cam " + nm2, c))
-            if lay2 < lay:                         # follower swept below
-                idx = np.linspace(0, len(d2["psi"]) - 1, n_pose).astype(int)
-                best = 1e9
-                for k in idx:
-                    ps = d2["psi"][k]
-                    R = d2["F"] + d2["l"] * np.array([math.cos(ps), math.sin(ps)])
-                    a, b = d2["F"], R
-                    t_ = np.clip(np.dot(pin - a, b - a) / np.dot(b - a, b - a), 0, 1)
-                    best = min(best, np.hypot(*(pin - (a + t_ * (b - a)))) - 7 - 2.2)
-                    if nm2 != "pen":
-                        rs = p.module * d2["zf"] / 2 + p.module
-                        dd = np.hypot(*(pin - d2["F"]))
-                        if abs(dd - (rs - 2.5)) < 3.5 + 2.2:
-                            a_m = math.atan2(*(np.zeros(2) - d2["F"])[::-1])
-                            ap = math.atan2(*(pin - d2["F"])[::-1])
-                            if abs((ap - a_m + math.pi) % (2 * math.pi) - math.pi) < np.ptp(d2["psi"]) / 2 + 0.3:
-                                best = min(best, -1.0)
-                out.append((nm, "follower " + nm2, best))
-        # shoulder hubs / arm parts never reach the drive area (checked by angle in README)
-    return out
-
-
 # ================================================================== output
 def export(parts, outdir="cad"):
     os.makedirs(f"{outdir}/stl", exist_ok=True)
-    for f in os.listdir(f"{outdir}/stl"):          # drop stale parts
+    for f in os.listdir(f"{outdir}/stl"):
         if f.endswith(".stl"):
             os.remove(f"{outdir}/stl/{f}")
     asm = cq.Assembly(name="drawing_arm")
@@ -416,21 +499,22 @@ def preview(parts, path):
     fig = plt.figure(figsize=(14, 6.5))
     ax1 = fig.add_subplot(1, 2, 1)
     ax2 = fig.add_subplot(1, 2, 2, projection="3d")
+    allv = []
     for name, (solid, layer, color) in sorted(parts.items(), key=lambda kv: kv[1][1]):
         verts, tris = solid.val().tessellate(0.3, 0.3)
         V = np.array([(v.x, v.y, v.z) for v in verts])
         F = np.array(tris)
+        allv.append(V)
         a, b, c = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
         nz = np.cross(b - a, c - a)
         up = nz[:, 2] / (np.linalg.norm(nz, axis=1) + 1e-12) > 0.99
-        for tri in F[up]:                               # top view: upward faces
+        for tri in F[up]:
             ax1.fill(V[tri, 0], V[tri, 1], color=color, lw=0, alpha=0.85)
-        pc = Poly3DCollection(V[F], facecolor=color, edgecolor="none", alpha=0.95)
-        ax2.add_collection3d(pc)
+        ax2.add_collection3d(Poly3DCollection(V[F], facecolor=color, edgecolor="none", alpha=0.95))
     ax1.set_aspect("equal")
     ax1.set_title("top view (assembled at cam angle 0)")
     ax1.grid(alpha=0.2)
-    allv = np.vstack([np.array([(v.x, v.y, v.z) for v in s.val().tessellate(1, 1)[0]]) for s, _, _ in parts.values()])
+    allv = np.vstack(allv)
     lo, hi = allv.min(0), allv.max(0)
     mid, rng = (lo + hi) / 2, (hi - lo).max() / 2
     ax2.set_xlim(mid[0] - rng, mid[0] + rng)
@@ -444,23 +528,32 @@ def preview(parts, path):
     plt.close(fig)
 
 
-if __name__ == "__main__":
-    from arm_linkage import PAPER, builtin_shape
+def build_all(src="heart", out="cad", cad=True):
+    from arm_linkage import builtin_shape
     from vector_input import fit_to_box, load_svg
-
-    src = sys.argv[1] if len(sys.argv) > 1 else "heart"
     strokes = load_svg(src) if src.endswith(".svg") else builtin_shape(src)
     g = Geometry()
     plan, dp = plan_for_cams(g, fit_to_box(strokes, PAPER))
     cs = design_cams(plan, g, dp)
-    print(report(cs))
     if any(a is None for a in cs.axes + [cs.pen_axis]):
-        sys.exit("some cams are infeasible for this drawing - try a simpler one")
+        raise SystemExit(report(cs) + "\nsome cams are infeasible for this drawing - try a simpler one")
+    b = Builder(g, cs)
+    parts = b.build() if cad else None
+    return g, plan, cs, b, parts
+
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
+    src = sys.argv[1] if len(sys.argv) > 1 else "heart"
+    g, plan, cs, b, parts = build_all(src)
+    print(report(cs))
     plot_cams(cs, "cad/cams.png")
-    bad = [c for c in drive_clearance(cs) if c[2] < 0]
-    for pin, obs, c in drive_clearance(cs):
-        print(f"  pivot pin {pin:4s} vs {obs:12s}: {c:6.1f} mm" + ("   <-- COLLISION" if c < 0 else ""))
-    parts = Builder(g, cs).build()
+    for what, who, lay, c in drive_clearance(b.layout):
+        print(f"  {what:24s} {c:6.1f} mm  (nearest: {who} L{lay})" + ("   <-- COLLISION" if c < 0 else ""))
+    srep = spr.report(b.springs)
+    print(srep)
+    with open("cad/springs.md", "w", encoding="utf-8") as f:
+        f.write(srep)
     export(parts)
     preview(parts, "cad/preview.png")
-    print(f"{len(parts)} parts -> cad/stl/*.stl, cad/assembly.step, cad/preview.png, cad/cams.png")
+    print(f"{len(parts)} parts -> cad/stl/*.stl, cad/assembly.step, cad/preview.png, cad/cams.png, cad/springs.md")

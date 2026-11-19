@@ -23,24 +23,29 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from config import CFG
 from arm_kinematics import (HAND_GRID, ik_grid, inverse_dynamics, mass_matrix,
                             mass_params, wrap_np, kinetic_energy, solve_ik)
 
 
 # ------------------------------------------------------------------ params
+_P = CFG["plan"]
+
+
 @dataclass
 class PlanParams:
-    dt: float = 0.01               # s, trajectory sample time
-    power_gain: float = 28.0       # k in v = k R^(1/3)  [mm^(2/3)/s]
-    v_min: float = 8.0             # mm/s
-    v_max: float = 220.0           # mm/s, pen-down cap
-    a_max: float = 1500.0          # mm/s^2, tangential acceleration cap
-    pen_dwell: float = 0.08        # s to lift or lower the pen
-    w_energy: float = 1.0          # weight of kinetic-energy term
-    w_comfort: float = 0.05        # weight of ROM-discomfort term (per second)
-    w_hand: float = 0.0            # extra penalty on hand-angle rate (cam mode)
-    band: int = 4                  # DP: max hand-angle grid steps per DP sample
-    dp_stride: int = 2             # DP runs on every n-th sample, then interpolated
+    """Defaults come from params.toml [plan]."""
+    dt: float = _P["dt"]                   # s, trajectory sample time
+    power_gain: float = _P["power_gain"]   # k in v = k R^(1/3)
+    v_min: float = _P["v_min"]             # mm/s
+    v_max: float = _P["v_max"]             # mm/s, pen-down cap
+    a_max: float = _P["a_max"]             # mm/s^2, tangential acceleration cap
+    pen_dwell: float = _P["pen_dwell"]     # s to lift or lower the pen
+    w_energy: float = _P["w_energy"]       # weight of kinetic-energy term
+    w_comfort: float = _P["w_comfort"]     # weight of ROM-discomfort term
+    w_hand: float = _P["w_hand"]           # extra penalty on hand-angle rate
+    band: int = _P["band"]                 # DP: max hand-angle grid steps per DP sample
+    dp_stride: int = _P["dp_stride"]       # DP runs on every n-th sample
 
 
 # ------------------------------------------------------------ 1. ordering
