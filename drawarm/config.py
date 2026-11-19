@@ -1,16 +1,19 @@
 """
 config.py - loads params.toml (the single source of truth for every module).
 
-    from config import CFG          # nested dict, angles still in degrees
+    from .config import CFG          # nested dict, angles still in degrees
     CFG["arm"]["L1"]
 
-Set DRAWING_ARM_PARAMS=/path/to/other.toml to use another parameter file.
+Environment overrides:
+    DRAWING_ARM_PARAMS=/path/to/other.toml   use another parameter file
+    DRAWING_ARM_OUT=/path/to/dir             where generated files go (default ./output)
 """
 import os
 import tomllib
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-PATH = os.environ.get("DRAWING_ARM_PARAMS", os.path.join(_HERE, "params.toml"))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PATH = os.environ.get("DRAWING_ARM_PARAMS", os.path.join(ROOT, "params.toml"))
+OUT = os.environ.get("DRAWING_ARM_OUT", os.path.join(ROOT, "output"))
 
 with open(PATH, "rb") as _f:
     CFG = tomllib.load(_f)
@@ -27,3 +30,10 @@ LAYER = dict(cam_M2=0, crank_M2=1, follow_M2=1, coupler_E=2, cam_M1=2, upper_arm
 def thickness(part):
     """Plate thickness (mm) of a part, from its layer."""
     return CFG["parts"]["layer_thickness"][LAYER[part]]
+
+
+def out_path(*parts):
+    """Path inside the output folder (created on demand)."""
+    p = os.path.join(OUT, *parts)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    return p

@@ -1,5 +1,5 @@
 """
-arm_kinematics.py - geometry, range of motion, FK/IK and rigid-body dynamics
+kinematics.py - geometry, range of motion, FK/IK and rigid-body dynamics
 for the planar 3-joint drawing arm (all inputs coaxial at the shoulder).
 
 Frame (top view): shoulder S at the origin, body behind it (x < 0), "forward"
@@ -15,11 +15,11 @@ the generalised coordinates of the dynamics, and the motor torques are exactly
 the generalised forces for them (virtual work through ideal parallelograms).
 """
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import numpy as np
 
-from config import CFG
+from .config import CFG
 
 TAU = 2 * math.pi
 D = math.radians
@@ -276,7 +276,7 @@ def kinetic_energy(H, q, qd):
 
 def paper_motor_range(g):
     """Motor-shaft angle range needed to reach the whole paper (any drawing)."""
-    from config import PAPER
+    from .config import PAPER
     M = []
     for x in np.linspace(PAPER[0], PAPER[2], 14):
         for y in np.linspace(PAPER[1], PAPER[3], 12):

@@ -1,5 +1,5 @@
 """
-path_planner.py - from pen strokes to timed, minimum-energy motor trajectories.
+planner.py - from pen strokes to timed, minimum-energy motor trajectories.
 
 Pipeline
   1. order_strokes   greedy nearest-neighbour, strokes may be reversed and
@@ -23,8 +23,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from config import CFG
-from arm_kinematics import (HAND_GRID, ik_grid, inverse_dynamics, mass_matrix,
+from .config import CFG
+from .kinematics import (HAND_GRID, ik_grid, inverse_dynamics, mass_matrix,
                             mass_params, wrap_np, kinetic_energy, solve_ik)
 
 

@@ -2,7 +2,7 @@
 structural.py - loads, stress and strain in every link, pin joint, gear and cam
 of the drawing arm, plus the pen-tip error they cause.
 
-    python structural.py [shape|file.svg]   -> prints a report, writes cad/strain_<name>.md
+    python -m drawarm strain [shape|file.svg]   -> prints a report, writes output/strain_<name>.md
 
 Load cases
   A  cam drive   : plan_for_cams (the hardware as designed), pen drag on
@@ -29,15 +29,13 @@ Model (planar, all vectorised over time samples, units mm / N / N*mm)
 All dimensions, materials and loads come from params.toml.
 """
 import math
-import os
-import sys
 from dataclasses import dataclass
 
 import numpy as np
 
-from arm_kinematics import Geometry, Linkage, inverse_dynamics, mass_params, paper_motor_range
-from config import CFG, PAPER, thickness
-import springs as spr
+from .kinematics import Geometry, Linkage, inverse_dynamics, mass_params, paper_motor_range
+from .config import CFG, PAPER, out_path, thickness
+from . import springs as spr
 
 PC, PR, DR, LD = CFG["parts"], CFG["parts"]["radius"], CFG["drive"], CFG["loads"]
 PIN_D, AXLE_D = PC["pin_bore"], PC["axle_bore"]
@@ -402,7 +400,7 @@ def dynamic_case(g, plan, mu=LD["pen_mu"], N_pen=LD["pen_normal"]):
 
 
 def static_case(g, F=LD["push"], ndir=16):
-    from arm_kinematics import solve_ik
+    from .kinematics import solve_ik
     M = []
     for x in np.linspace(PAPER[0], PAPER[2], 12):
         for y in np.linspace(PAPER[1], PAPER[3], 10):
@@ -459,13 +457,13 @@ def fmt_joints(j):
 
 
 def run(src="heart"):
-    from arm_linkage import builtin_shape
-    from cam_drive import design_cams, plan_for_cams
-    from path_planner import plan_job
-    from vector_input import fit_to_box, load_svg
+    from .shapes import drawing_name, load_drawing
+    from .cams import design_cams, plan_for_cams
+    from .planner import plan_job
+    from .inputs import fit_to_box
 
     g = Geometry()
-    strokes = fit_to_box(load_svg(src) if src.endswith(".svg") else builtin_shape(src), PAPER)
+    strokes = fit_to_box(load_drawing(src), PAPER)
     th = PC["layer_thickness"]
     md = [f"# Structural check – `{src}`", "",
           f"Parameters: `params.toml`. Material: {MAT.name}, E = {MAT.E:.0f} MPa, strength "
@@ -537,13 +535,6 @@ def run(src="heart"):
            "A push larger than the spring preload reverses the gear load: the arm then moves through the "
            "backlash and springs back when released.", ""]
     text = "\n".join(md)
-    os.makedirs("cad", exist_ok=True)
-    name = os.path.splitext(os.path.basename(src))[0]
-    with open(f"cad/strain_{name}.md", "w", encoding="utf-8") as f:
+    with open(out_path(f"strain_{drawing_name(src)}.md"), "w", encoding="utf-8") as f:
         f.write(text)
     return text
-
-
-if __name__ == "__main__":
-    sys.stdout.reconfigure(encoding="utf-8")
-    print(run(sys.argv[1] if len(sys.argv) > 1 else "heart"))

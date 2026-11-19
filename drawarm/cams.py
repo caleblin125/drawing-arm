@@ -1,5 +1,5 @@
 """
-cam_drive.py - encode a planned drawing onto a stack of groove cams driven by
+cams.py - encode a planned drawing onto a stack of groove cams driven by
 ONE motor.
 
 Layout (top view, same frame as the arm, mm):
@@ -26,8 +26,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from arm_kinematics import Geometry
-from config import CFG
+from .kinematics import Geometry
+from .config import CFG
 
 D = math.radians
 
@@ -289,7 +289,7 @@ def plot_cams(cs: CamSet, path):
 def plan_for_cams(g, strokes, p: DriveParams = None, iters=3):
     """Plan tuned for cams: gentler accelerations, smooth hand, the loop starts
     on the drawing, and pen ramps sized in cam degrees (overlapping travel)."""
-    from path_planner import PlanParams, plan_job, order_strokes
+    from .planner import PlanParams, plan_job, order_strokes
     p = p or DriveParams()
     strokes = order_strokes(strokes, strokes[0][0])
     start = strokes[0][0]
@@ -301,18 +301,3 @@ def plan_for_cams(g, strokes, p: DriveParams = None, iters=3):
         p.pen_ramp = p.pen_ramp_deg / 360 * T
         pp.pen_dwell = p.pen_ramp / 2           # other half overlaps the travel
     return plan, p
-
-
-if __name__ == "__main__":
-    import sys
-    from arm_linkage import PAPER, builtin_shape
-    from path_planner import PlanParams, plan_job
-    from vector_input import fit_to_box, load_svg
-
-    src = sys.argv[1] if len(sys.argv) > 1 else "heart"
-    strokes = load_svg(src) if src.endswith(".svg") else builtin_shape(src)
-    g = Geometry()
-    plan, p = plan_for_cams(g, fit_to_box(strokes, PAPER))
-    cs = design_cams(plan, g, p)
-    print(report(cs))
-    plot_cams(cs, f"cad/cams_{src.split('/')[-1].split('.')[0]}.png")

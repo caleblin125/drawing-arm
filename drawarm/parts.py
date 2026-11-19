@@ -1,11 +1,11 @@
 """
 parts.py - parametric 3D-printable parts for the drawing arm + cam drive (CadQuery).
 
-    python parts.py [shape|file.svg]   -> cad/stl/*.stl, cad/assembly.step,
-                                          cad/preview.png, cad/cams.png, cad/springs.md
+    python -m drawarm parts [shape|file.svg]   -> output/stl/*.stl, output/assembly.step,
+                                                  output/preview.png, output/cams.png, output/springs.md
 
 All dimensions come from params.toml ([parts], [drive], [arm]); geometry from
-Geometry (arm_kinematics) and the CamSet (cam_drive).
+Geometry (kinematics.py) and the CamSet (cams.py).
 
 Layer stack, bottom -> top (thickness per layer from [parts].layer_thickness):
 
@@ -33,15 +33,14 @@ side.
 """
 import math
 import os
-import sys
 
 import numpy as np
 import cadquery as cq
 
-from arm_kinematics import Geometry, Linkage, paper_motor_range
-from cam_drive import design_cams, plan_for_cams, report, plot_cams
-import springs as spr
-from config import CFG, PAPER, LAYER
+from .kinematics import Geometry, Linkage, paper_motor_range
+from .cams import design_cams, plan_for_cams, report
+from . import springs as spr
+from .config import CFG, PAPER, LAYER, OUT
 
 PC, PR, DR = CFG["parts"], CFG["parts"]["radius"], CFG["drive"]
 GAP = PC["gap"]
@@ -189,7 +188,7 @@ class Layout:
             if lay not in CAM_LAYERS:
                 self.items.append((lay, "camshaft spacer", lambda q: np.hypot(*(q - cs.O)) - SPACER_R))
         # arm-side sweeps near the shoulder (cranks/couplers over the whole paper)
-        from arm_kinematics import solve_ik
+        from .kinematics import solve_ik
         lk = Linkage(g)
         poses = [lk.solve(*solve_ik(g, (x, y))["inputs"])
                  for x in np.linspace(PAPER[0], PAPER[2], 7) for y in np.linspace(PAPER[1], PAPER[3], 5)]
@@ -477,7 +476,7 @@ class Builder:
 
 
 # ================================================================== output
-def export(parts, outdir="cad"):
+def export(parts, outdir=OUT):
     os.makedirs(f"{outdir}/stl", exist_ok=True)
     for f in os.listdir(f"{outdir}/stl"):
         if f.endswith(".stl"):
@@ -528,10 +527,10 @@ def preview(parts, path):
     plt.close(fig)
 
 
-def build_all(src="heart", out="cad", cad=True):
-    from arm_linkage import builtin_shape
-    from vector_input import fit_to_box, load_svg
-    strokes = load_svg(src) if src.endswith(".svg") else builtin_shape(src)
+def build_all(src="heart", cad=True):
+    from .shapes import load_drawing
+    from .inputs import fit_to_box
+    strokes = load_drawing(src)
     g = Geometry()
     plan, dp = plan_for_cams(g, fit_to_box(strokes, PAPER))
     cs = design_cams(plan, g, dp)
@@ -540,20 +539,3 @@ def build_all(src="heart", out="cad", cad=True):
     b = Builder(g, cs)
     parts = b.build() if cad else None
     return g, plan, cs, b, parts
-
-
-if __name__ == "__main__":
-    sys.stdout.reconfigure(encoding="utf-8")
-    src = sys.argv[1] if len(sys.argv) > 1 else "heart"
-    g, plan, cs, b, parts = build_all(src)
-    print(report(cs))
-    plot_cams(cs, "cad/cams.png")
-    for what, who, lay, c in drive_clearance(b.layout):
-        print(f"  {what:24s} {c:6.1f} mm  (nearest: {who} L{lay})" + ("   <-- COLLISION" if c < 0 else ""))
-    srep = spr.report(b.springs)
-    print(srep)
-    with open("cad/springs.md", "w", encoding="utf-8") as f:
-        f.write(srep)
-    export(parts)
-    preview(parts, "cad/preview.png")
-    print(f"{len(parts)} parts -> cad/stl/*.stl, cad/assembly.step, cad/preview.png, cad/cams.png, cad/springs.md")

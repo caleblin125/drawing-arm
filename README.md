@@ -1,30 +1,56 @@
 # drawing-arm
 
-Kinematics, motion planning and a tkinter simulator for a human-like drawing
-automaton: a planar shoulder–elbow–wrist arm whose **three input shafts sit
-coaxially at the shoulder** (on the body), with the elbow and wrist driven
-remotely through parallelogram linkages.
+A human-like drawing automaton: a planar shoulder–elbow–wrist arm whose
+**three input shafts sit coaxially at the shoulder**, with the elbow and wrist
+driven remotely through parallelogram linkages, all powered by **one motor**
+through a stack of cams. This repo holds the kinematics, motion planning,
+cam synthesis, printable parts, structural check and a tkinter simulator.
+
+![parts preview](docs/images/preview.png)
+
+## Quick start
 
 ```
 pip install -r requirements.txt
-python arm_linkage.py          # simulator
-python arm_linkage.py --test   # numerical self-checks
-python cam_drive.py heart      # encode a drawing onto cams (one motor)
-python parts.py heart          # printable parts -> cad/stl/*.stl, cad/assembly.step, cad/springs.md
-python structural.py heart     # stress / strain / pen error report -> cad/strain_heart.md
+python -m drawarm sim             # simulator (draw with the mouse, load SVG/images)
+python -m drawarm test            # numerical self-checks
+python -m drawarm cams heart      # encode a drawing onto cams
+python -m drawarm parts heart     # printable parts -> output/stl, output/assembly.step
+python -m drawarm strain heart    # stress / strain / pen-error report
 ```
 
+`heart` can be any built-in shape (circle, star, spiral, heart, lissajous,
+flower, grid), an `.svg` file, or an image. Generated files go to `output/`
+(not tracked by git).
+
 **All parameters live in [`params.toml`](params.toml)**: arm lengths, masses,
-range-of-motion profiles, planner weights, gears, rollers, spring preload,
-layer thicknesses, link widths, material and load cases. Every module reads
-its defaults from it (`config.py`).
+range-of-motion profiles, planner weights, paper area, gears, rollers, spring
+preload, layer thicknesses, link widths, material and load cases.
 
-![parts preview](cad/preview.png)
+## Layout
 
-**One motor:** the drawing is stored in a stack of groove cams on one
-camshaft (one revolution = one drawing). Each cam drives one input shaft via a
-3:1 gear sector; a fourth cam lifts the pen. See [DESIGN.md](DESIGN.md) for
-the options considered, capacity limits, layer stack, BOM and print notes.
+```
+params.toml          every parameter (single source of truth)
+drawarm/             the Python package
+  config.py          loads params.toml, layer map, output folder
+  kinematics.py      geometry, human range of motion, FK/IK, dynamics
+  planner.py         stroke order, human-like timing, min-energy DP
+  inputs.py          SVG / image -> strokes
+  shapes.py          built-in drawings, load_drawing()
+  cams.py            one-motor cam stack synthesis
+  springs.py         anti-backlash torsion springs
+  parts.py           CadQuery parts, STL/STEP export, clearance checks
+  structural.py      loads, stress, strain, pen-tip error
+  sim.py             tkinter simulator
+  selftest.py        self-checks
+  __main__.py        command line
+docs/
+  DESIGN.md          drive options, capacity, structural summary, BOM, printing
+  reports/           example spring spec and structural report (heart)
+  images/            figures used in the docs
+examples/sample.svg  test drawing
+output/              generated files (git-ignored)
+```
 
 ## Mechanism
 
@@ -34,63 +60,57 @@ the options considered, capacity limits, layer stack, BOM and print notes.
 | M2 | forearm (absolute angle) | parallelogram across the upper arm (shoulder crank → coupler → forearm tail): the "5-bar with both inputs at the shoulder" |
 | M3 | hand (absolute angle) | parallelogram across the upper arm → free L-shaped bell-crank at the elbow → parallelogram across the forearm → hand crank |
 
-Because every motor sets an **absolute** link angle, the kinematics decouple:
+Because every input sets an **absolute** link angle, the kinematics decouple:
 turning M1 alone translates the forearm and hand without rotating them.
-
 Default sizes (mm): upper arm 300, forearm 250, hand→pen 70; cranks 60 / 45 / 40.
-Edit `Geometry` in `arm_kinematics.py`.
 
 **Dead points.** A parallelogram can flip into an anti-parallelogram when its
 crank lines up with its link. The elbow is kept between 20° and 160° of bend,
 and the 90° elbow bell-crank keeps both wrist stages well conditioned. The
-simulator shows the transmission margin |sin| for every stage (1 = ideal),
-and manual mode lets you drive through a dead point to watch the flip.
+simulator shows the transmission margin |sin| for every stage (1 = ideal), and
+manual mode lets you drive through a dead point to watch the flip.
+
+## One motor: cams
+
+The drawing is stored in a stack of groove cams on one camshaft (one
+revolution = one drawing). Each cam drives one shoulder hub through a 3:1 gear
+sector; a fourth cam lifts the pen. Torsion springs on the shoulder axle
+preload every hub so gear backlash and groove clearance never move the pen.
+See [docs/DESIGN.md](docs/DESIGN.md) for the encoding options considered,
+capacity limits, structural results, layer stack, BOM and print notes.
+
+![cams for the heart](docs/images/cams_heart.png)
 
 ## Human range of motion
 
-Profiles in `arm_kinematics.ROM_PROFILES` (typical adult active ROM,
-clinical goniometry norms):
+Profiles in `params.toml` (`[[rom.profile]]`, typical adult active ROM):
 
 * shoulder horizontal abduction 45° / adduction 130°, measured from the arm pointing straight out sideways
 * elbow flexion 20°–145° (0° is the parallelogram dead point)
 * wrist flexion 80° / extension 70° (palm sideways), or radial 20° / ulnar 30° deviation (palm down)
 
 The IK rejects poses outside the profile and adds a quartic *discomfort* cost
-that pushes joints toward mid-range, as people do. Green shading in the GUI
-shows the reachable pen area.
+that pushes joints toward mid-range, as people do. Green shading in the
+simulator shows the reachable pen area.
 
-## Motion planning (`path_planner.py`)
+## Motion planning (`drawarm/planner.py`)
 
-1. **Stroke order**: greedy nearest-neighbour. Strokes may be reversed, and closed loops start at their nearest point.
-2. **Human-like timing**:
-   * pen down follows the **2/3 power law** `v = k·R^(1/3)`, so the pen slows in tight curves and corners, with an acceleration limit. Each stroke starts and ends at rest.
-   * pen up is a **minimum-jerk** straight reach, with a Fitts-style log duration.
-3. **Minimum-energy redundancy resolution**: the hand angle is redundant for
-   2-D pen position. Dynamic programming over a 2° grid of hand angles minimises
-   `∫ [ q̇ᵀ M(q) q̇ + w_c · discomfort(q) + margin penalty ] dt`
-   over the whole job (globally, not point by point). The planner then smooths
-   the result and re-solves the arm exactly. It typically uses 10–15% less
-   kinetic effort than greedy per-point IK, with lower RMS torque.
-4. **Dynamics**: exact planar rigid-body model in absolute coordinates, so
-   motor torque is the generalised force:
-   `τ_j = Σ_k H_jk [cos(q_j−q_k) q̈_k + sin(q_j−q_k) q̇_k²]`, plus the
-   reflected motor inertia. The self-test checks it with a power balance.
+1. **Stroke order**: greedy nearest-neighbour; strokes may be reversed, and closed loops start at their nearest point.
+2. **Human-like timing**: pen down follows the **2/3 power law** `v = k·R^(1/3)` (slower in tight curves and corners) with an acceleration limit; pen up is a **minimum-jerk** reach with a Fitts-style duration.
+3. **Minimum-energy redundancy resolution**: dynamic programming over the redundant hand angle minimises `∫ [ q̇ᵀ M(q) q̇ + w_c · discomfort(q) + margin penalty ] dt` over the whole job, then smooths and re-solves the arm exactly (10–15 % less kinetic effort than greedy IK).
+4. **Dynamics**: exact planar rigid-body model in absolute coordinates, `τ_j = Σ_k H_jk [cos(q_j−q_k) q̈_k + sin(q_j−q_k) q̇_k²]`, plus reflected drive inertia (checked by a power balance in the self-test).
 
-The **Motors** tab shows range, peak/RMS speed and torque, and work per motor,
-plots the trajectories, and exports a CSV (`t, pen, x, y, joint angles, motor
-angles, speeds, torques`) for sizing motors and gearboxes. Masses and inertias
-are placeholders until the CAD exists.
+The simulator's **Motors** tab shows range, speed, torque and work per input,
+plots the trajectories and exports a CSV.
 
-## Inputs (`vector_input.py`)
+## Inputs (`drawarm/inputs.py`)
 
-* **SVG**: paths (all commands including arcs), line, polyline, polygon, rect, circle, ellipse, and nested transforms
-* **Images** (PNG/JPG/...): `outline` (iso-contours of brightness), `hatch` (tone-dependent cross-hatching with alternating direction), or `both`
+* **SVG**: paths (all commands including arcs), line, polyline, polygon, rect, circle, ellipse, nested transforms
+* **Images**: `outline` (brightness iso-contours), `hatch` (tone-dependent cross-hatching), or `both`
 * Drawings are scaled to fit the paper (260 × 220 mm, 250 mm in front of the shoulder)
-
-`examples/sample.svg` is a small test drawing.
 
 ## Not modelled yet
 
 * rotation of the whole arm plane about a vertical axis
-* pen-lift actuator (pen up/down is a flag)
-* gravity, friction, link compliance, backlash
+* frame / top plate, motor and worm mount, pen-lift cable anchor
+* gravity, friction, fatigue

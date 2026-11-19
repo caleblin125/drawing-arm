@@ -1,5 +1,5 @@
 """
-vector_input.py - turn SVG files and raster images into pen strokes.
+inputs.py - turn SVG files and raster images into pen strokes.
 
 Every loader returns a list of strokes; a stroke is an (n, 2) float array of
 points in the source's own units with y pointing DOWN (SVG / image
