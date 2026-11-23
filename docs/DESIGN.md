@@ -100,8 +100,8 @@ The stack-aware pivot placement makes upper cams grow when lower cams are big.
 | Drawing | Turns | Drum OD × length | Bay depth | vs. single-turn cams |
 |---|---|---|---|---|
 | heart | 4 | 67 × 190 mm | 344 mm | cams up to 155 mm |
-| flower | 4 | 99 × 190 mm | ~344 mm | cams up to 208 mm |
-| examples/sample.svg | 6 | 144 × 262 mm | ~460 mm | impossible on one turn |
+| flower | 4 | 99 × 190 mm | 344 mm | cams up to 208 mm |
+| examples/sample.svg | 6 | 144 × 262 mm | 488 mm | impossible on one turn |
 
 Trade-offs: much smaller and far more capacity, but a tall body (the bay),
 long rocker shafts, a custom 36 mm-lead screw, and the drum STL is a mesh
