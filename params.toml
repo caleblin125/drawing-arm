@@ -103,6 +103,21 @@ sign = [1, 1, 1]                  # +1 = CCW on the hub
 torque_variation = 0.25           # allowed +- torque change over the hub travel (whole paper)
 max_od = 21.0                     # spring OD limit (hub boss is 20 mm)
 
+# ---------------------------------------------------------- cam drum
+[drum]              # multi-turn drum (python -m drawarm drum ...); every key optional
+turns = 4           # drum revolutions per drawing
+n_per_turn = 720    # samples per revolution
+pitch = 0.0         # lead-screw lead per turn (0 = smallest standard lead that fits the bands)
+pitch_options = [8, 10, 12, 14, 16, 20, 24, 30, 36, 40]
+band_clearance = 1.0    # axial gap between a finger and a neighbouring rib
+finger_t = 3.0      # finger plate thickness (only the finger + roller enter the drum)
+finger_gap = 0.5
+base_gap = 1.5      # drum core below the lowest band surface
+end_margin = 5.0
+contact = "below_base"  # rollers in a bay under the base plate (rocker shafts) or "cam_layers"
+pen_pivot_step = 10.0   # deg between candidate pen-follower pivots
+pen_ramp_deg = 24.0     # drum degrees per pen up/down ramp
+
 # ------------------------------------------------------------- parts
 [parts]
 gap = 1.0           # washer gap between layers

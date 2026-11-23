@@ -14,6 +14,9 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("sim", help="open the tkinter simulator")
     sub.add_parser("test", help="run the numerical self-checks")
+    pd = sub.add_parser("drum", help="multi-turn cam drum: report, output/drum.stl, output/drum_<name>.png")
+    pd.add_argument("drawing", nargs="?", default="heart")
+    pd.add_argument("--turns", type=int, default=None, help="drum turns per drawing (default: params.toml)")
     for name, text in (("cams", "design the cam stack for a drawing (+ output/cams_<name>.png)"),
                        ("parts", "generate printable parts: STL, STEP, preview, spring spec"),
                        ("strain", "structural report: stress, strain, pen error")):
@@ -56,6 +59,22 @@ def main(argv=None):
         export(parts)
         preview(parts, out_path("preview.png"))
         print(f"{len(parts)} parts -> {OUT}: stl/*.stl, assembly.step, preview.png, cams.png, springs.md")
+    elif a.cmd == "drum":
+        from .cams import plan_for_cams
+        from .config import PAPER, out_path
+        from .drum import DrumParams, design_drum, drum_triangles, plot_drum, report, write_stl
+        from .inputs import fit_to_box
+        from .kinematics import Geometry
+        from .shapes import drawing_name, load_drawing
+        g = Geometry()
+        dp = DrumParams() if a.turns is None else DrumParams(turns=a.turns)
+        plan, p = plan_for_cams(g, fit_to_box(load_drawing(a.drawing), PAPER))
+        ds = design_drum(plan, g, p, dp)
+        print(report(ds))
+        if ds.pitch and all(x is not None for x in ds.axes + [ds.pen_axis]):
+            plot_drum(ds, out_path(f"drum_{drawing_name(a.drawing)}.png"))
+            write_stl(drum_triangles(ds), out_path("drum.stl"))
+            print(f"-> {out_path('drum.stl')}, {out_path(f'drum_{drawing_name(a.drawing)}.png')}")
     elif a.cmd == "strain":
         from .structural import run
         print(run(a.drawing))

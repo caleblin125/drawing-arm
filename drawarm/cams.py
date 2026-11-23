@@ -68,6 +68,7 @@ class DriveParams:
     retime_floor: float = _DR.get("retime_floor", 0.25)   # min cam-angle rate, fraction of uniform
     retime_accel_ratio: float = _DR.get("retime_accel_ratio", 20.0)  # curvature : slope**2 budget
     max_contact: float = _DR.get("max_contact", 0.0)      # MPa groove Hertz limit (0 = not checked)
+    pen_pivot_step: float = _DR.get("pen_pivot_step", 30.0)  # deg between candidate pen-follower pivots
 
 
 # ------------------------------------------------------------ loop closing
@@ -126,7 +127,7 @@ def _topp_rate(psi, du, V, A):
     return np.sqrt(np.maximum(x, 1e-12))
 
 
-def retime_map(t, M, pen, p):
+def retime_map(t, M, pen, p, turns=1):
     """Cam angle (0..2pi) reached at each time sample t.
 
     The arm's path (the motor angles along plan time u) is kept; only the
@@ -150,7 +151,7 @@ def retime_map(t, M, pen, p):
     # pen transitions: guarantee pen_ramp_deg of cam around each one
     edges = np.flatnonzero(np.diff(pen) != 0)
     half = max(1, int(round(0.5 * p.pen_ramp / dt)))
-    need = math.radians(p.pen_ramp_deg)
+    need = math.radians(p.pen_ramp_deg) / turns           # result is scaled by `turns` later
     for _ in range(8):
         theta = 2 * np.pi * np.cumsum(w) / w.sum()
         short = False
@@ -166,27 +167,30 @@ def retime_map(t, M, pen, p):
     return 2 * np.pi * (np.cumsum(w) - w[0]) / w.sum()
 
 
-def cam_profiles(plan, p: DriveParams):
+def cam_profiles(plan, p: DriveParams, turns=1, n_per_turn=None):
     """-> theta (n,), motor angles (n,3) rad, pen (n,) in [0,1] (1 = down),
-    period T (s), and t_of_theta (n,): the time on the camshaft (uniform
-    rotation over T) at which the arm reaches each cam sample."""
+    period T (s), and plan_time (n,): the plan time shown at each cam sample.
+    turns > 1 spreads the drawing over several revolutions (drum cams):
+    theta then runs 0 .. 2*pi*turns."""
+    n1 = n_per_turn or p.n
+    n = n1 * turns
     t, Mall, pen, T = _closed_loop(plan, p)
-    theta_u = np.linspace(0, 2 * np.pi, p.n, endpoint=False)
+    theta_u = np.linspace(0, 2 * np.pi * turns, n, endpoint=False)
     if p.retime > 0:
-        th_t = retime_map(t, Mall, pen, p)
+        th_t = retime_map(t, Mall, pen, p, turns) * turns
         src = np.interp(theta_u, th_t, t)                    # plan time at each cam sample
     else:
-        src = theta_u / (2 * np.pi) * T
+        src = theta_u / (2 * np.pi * turns) * T
     Mu = np.stack([np.interp(src, t, Mall[:, k], period=T) for k in range(3)], 1)
     pen_u = np.interp(src, t, pen, period=T)
     # pen: cycloidal ramps (centred on each transition), width in cam samples
-    if p.retime > 0:
-        w = max(1, int(round(p.pen_ramp_deg / 360 * p.n)))
+    if p.retime > 0 or turns > 1:
+        w = max(1, int(round(p.pen_ramp_deg / 360 * n1)))
     else:
         w = max(1, int(round(p.pen_ramp / (T / p.n))))       # original behaviour
     ker = 1 - np.cos(np.linspace(0, 2 * np.pi, w + 2)[1:-1])
     ker /= ker.sum()
-    pen_s = np.real(np.fft.ifft(np.fft.fft(pen_u) * np.fft.fft(np.r_[ker, np.zeros(p.n - len(ker))])))
+    pen_s = np.real(np.fft.ifft(np.fft.fft(pen_u) * np.fft.fft(np.r_[ker, np.zeros(n - len(ker))])))
     pen_s = np.roll(pen_s, -(len(ker) // 2))
     return theta_u, Mu, np.clip(pen_s, 0, 1), T, src
 
@@ -250,12 +254,15 @@ def groove_contact(ev, l, G, hub_torque, p):
     return float(np.sqrt(Fr * Es / (math.pi * p.roller_w * R)).max())
 
 
-def synth_axis(theta, rel, p, S, O, geared=True, name="", min_pivot=0.0, keepout=None, hub_torque=0.0):
+def synth_axis(theta, rel, p, S, O, geared=True, name="", min_pivot=0.0, keepout=None, hub_torque=0.0,
+               body_r=0.0):
     """rel: (n,) desired OUTPUT angle relative to its mean (rad).
     min_pivot: the follower pivot (and its standoff) must be at least this far
     from the camshaft, i.e. clear of every cam lower in the stack.
     keepout(F) -> clearance (mm) of the pivot standoff to lower followers' swept areas.
     hub_torque: design hub torque (N m) for the groove contact check (p.max_contact).
+    body_r: radius of a rotating body that spans every layer (a drum): the
+    shoulder hubs must clear it too.
     Returns the best design dict or None."""
     best = None
     ratios = [(zf, zf / p.z_hub) for zf in p.z_follow] if geared else [(0, 1.0)]
@@ -270,7 +277,8 @@ def synth_axis(theta, rel, p, S, O, geared=True, name="", min_pivot=0.0, keepout
                 if geared:
                     Fs = _circle_x(S, a, O, c)
                 else:
-                    Fs = [O + c * np.array([math.cos(ang), math.sin(ang)]) for ang in np.radians(np.arange(0, 360, 30))]
+                    Fs = [O + c * np.array([math.cos(ang), math.sin(ang)])
+                          for ang in np.radians(np.arange(0, 360, p.pen_pivot_step))]
                 for F in Fs:
                     for Rm in _circle_x(O, Rp, F, l):
                         psi0 = math.atan2(*(Rm - F)[::-1])
@@ -287,7 +295,7 @@ def synth_axis(theta, rel, p, S, O, geared=True, name="", min_pivot=0.0, keepout
                             continue
                         if keepout is not None and keepout(F) < 1.0:
                             continue
-                        if geared and np.hypot(*(S - O)) < ev["outer"] + p.module * p.z_hub / 2 + 3:
+                        if geared and np.hypot(*(S - O)) < max(ev["outer"], body_r) + p.module * p.z_hub / 2 + 3:
                             continue
                         if p.max_contact and geared and hub_torque > 0 and \
                                 groove_contact(ev, l, G, hub_torque, p) > p.max_contact:
