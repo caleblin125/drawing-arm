@@ -16,6 +16,7 @@ python -m drawarm sim             # simulator (draw with the mouse, load SVG/ima
 python -m drawarm test            # numerical self-checks
 python -m drawarm cams heart      # encode a drawing onto cams
 python -m drawarm parts heart     # printable parts -> output/stl, output/assembly.step
+python -m drawarm drum heart --parts   # multi-turn drum instead of cams (+ its parts)
 python -m drawarm strain heart    # stress / strain / pen-error report
 ```
 
@@ -37,7 +38,8 @@ drawarm/             the Python package
   planner.py         stroke order, human-like timing, min-energy DP
   inputs.py          SVG / image -> strokes
   shapes.py          built-in drawings, load_drawing()
-  cams.py            one-motor cam stack synthesis
+  cams.py            one-motor cam stack synthesis (+ re-timing)
+  drum.py            multi-turn cam drum
   springs.py         anti-backlash torsion springs
   parts.py           CadQuery parts, STL/STEP export, clearance checks
   structural.py      loads, stress, strain, pen-tip error
@@ -76,8 +78,12 @@ The drawing is stored in a stack of groove cams on one camshaft (one
 revolution = one drawing). Each cam drives one shoulder hub through a 3:1 gear
 sector; a fourth cam lifts the pen. Torsion springs on the shoulder axle
 preload every hub so gear backlash and groove clearance never move the pen.
-See [docs/DESIGN.md](docs/DESIGN.md) for the encoding options considered,
-capacity limits, structural results, layer stack, BOM and print notes.
+The plan is **re-timed** so the arm slows where a cam would be steep, which
+shrinks the cams. For drawings too long for one revolution, a **multi-turn
+drum** (helical bands, lead screw) holds several turns of track in a much
+smaller diameter. See [docs/DESIGN.md](docs/DESIGN.md) for the encoding
+options, capacity, the drum, structural results, layer stack, BOM and print
+notes.
 
 ![cams for the heart](docs/images/cams_heart.png)
 

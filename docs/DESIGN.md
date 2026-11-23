@@ -49,18 +49,66 @@ All numbers below come from **`params.toml`** – edit it and re-run
   angle held steady (often the wrist cam becomes a plain circle, i.e. M3 is
   idle), loop starts on the drawing, closed by a pen-up return, pen ramps of
   8° cam angle overlapping the travel moves.
+* **Re-timing** (`[drive].retime`, default 0.7): the camshaft turns at constant
+  speed, so a cam is steep wherever the arm moves fast. A time-optimal path
+  parameterisation (TOPP) keeps the arm's path but redistributes cam angle so
+  every follower's slope *and curvature* on the cam stay within a budget
+  (`retime_accel_ratio`), blended with uniform timing and floored so pauses
+  don't vanish; every pen lift keeps its 8° of cam. The arm then slows where
+  the cams would be steep. `retime = 0` reproduces the old uniform timing.
+* **Groove contact limit** (`[drive].max_contact`, 40 MPa): designs whose
+  roller-on-groove Hertz pressure (spring preload + running torque) would
+  exceed it are rejected, so smaller cams don't come at the cost of worn grooves.
 
 ### Capacity (current parameters)
 
-| Drawing | Cycle | Cam ODs (M1 / M2 / M3 / pen) |
-|---|---|---|
-| circle | 8.1 s | 94 / 105 / 55 / 156 mm |
-| heart | 8.6 s | 122 / 163 / 125 / 156 mm |
-| flower | 13.3 s | 216 / 222 / 215 / 175 mm |
-| examples/sample.svg (14 strokes) | 32 s | infeasible in one revolution |
+| Drawing | Cycle | Cam ODs, uniform timing, contact ≤ 40 MPa | Cam ODs, re-timed (0.7), contact ≤ 40 MPa |
+|---|---|---|---|
+| heart | 8.6 s | 153 / 187 / 165 / 156 mm | **142 / 132 / 55 / 155 mm** |
+| flower | 13.3 s | infeasible | **208 / 182 / 165 / 155 mm** |
+| examples/sample.svg (14 strokes) | 32 s | infeasible | infeasible → use the drum |
 
-One revolution holds roughly one or two closed shapes. The stack-aware pivot
-placement makes upper cams grow when lower cams are big.
+(M1 / M2 / M3 / pen.) One revolution holds roughly one or two closed shapes.
+The stack-aware pivot placement makes upper cams grow when lower cams are big.
+
+## Multi-turn drum (`drawarm/drum.py`)
+
+`python -m drawarm drum heart [--turns N] [--parts]`
+
+![drum bands](images/drum_heart.png)
+
+* A vertical drum at the camshaft position turns **N times per drawing** and
+  rises one lead per turn on a lead screw (fixed nut; the motor drives it
+  through a sliding key/spline).
+* Each follower reads a **raised helical band**. From the follower's fixed
+  plane a band is just a plate cam unrolled over N turns, so the synthesis,
+  re-timing and contact limit are the cam code with θ running 0…2πN.
+* Bands are **interleaved like a multi-start thread**. Only a thin **finger**
+  (3 mm) with the roller under it enters the drum envelope, so ribs of other
+  bands, at other heights modulo the lead, never touch it. Slot per band =
+  rib half-width + roller + finger + clearance = 9 mm, lead = 4 × 9 = 36 mm.
+* Default `contact = "below_base"`: the drum hangs in a **bay under the base
+  plate**; each follower is a rocker on a **steel 8 mm D-shaft** through the
+  base plate (sector gear on top, finger at the bottom). The finger stacking
+  order is chosen so no rocker shaft crosses another finger; the bay is deep
+  enough that the rising drum never reaches the base plate.
+* The anti-backlash springs keep the rollers on the bands, so bands are
+  single-sided ribs (no grooves).
+* End of drawing: reverse the motor (the arm retraces the drawing) or use a
+  half-nut and spring to drop the drum back with the followers lifted.
+
+| Drawing | Turns | Drum OD × length | Bay depth | vs. single-turn cams |
+|---|---|---|---|---|
+| heart | 4 | 67 × 190 mm | 344 mm | cams up to 155 mm |
+| flower | 4 | 99 × 190 mm | ~344 mm | cams up to 208 mm |
+| examples/sample.svg | 6 | 144 × 262 mm | ~460 mm | impossible on one turn |
+
+Trade-offs: much smaller and far more capacity, but a tall body (the bay),
+long rocker shafts, a custom 36 mm-lead screw, and the drum STL is a mesh
+(core + overlapping rib shells; slicers union them). Drum-mode parts are in
+`output/drum_parts/`.
+
+![drum mesh](images/drum_3d.png)
 
 ## Structural check (`drawarm/structural.py`, heart, PLA)
 
@@ -71,11 +119,12 @@ Full report: [reports/strain_heart.md](reports/strain_heart.md).
 | links (upper arm, forearm, cranks) | ≤ 0.4 MPa, ≤ 140 µε, SF > 100 | ≤ 4 MPa, ≤ 1300 µε, SF ≥ 11 |
 | couplers | SF > 1000, buckling SF ≥ 88 | buckling SF ≥ 4 |
 | gears (m1.5, 8 mm, incl. spring preload) | ≤ 7 MPa root, SF ≥ 6, **no load reversal** | ≤ 29 MPa, SF ≥ 1.6 |
-| cam grooves (684 roller) | 34–38 MPa Hertz, **SF 1.2–1.3** | – |
+| cam grooves (684 roller) | ≤ 38 MPa Hertz (limit 40), **SF ≈ 1.2** | – |
 | pen error | 0.6 mm bending, 0.03 mm coupler stretch, 0 backlash | 7 mm elastic |
 
 The cam grooves are the weakest point (preload raises roller force): print
-cams in PETG/nylon or raise `min_wall_radius`. Camshaft needs ≈ 0.37 N·m peak.
+cams in PETG/nylon, or lower `max_contact` (bigger cams). With re-timing the
+camshaft needs ≈ 0.29 N·m peak.
 
 ## Layer stack
 
