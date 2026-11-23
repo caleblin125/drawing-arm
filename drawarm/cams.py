@@ -16,6 +16,14 @@ Layout (top view, same frame as the arm, mm):
 One camshaft revolution = one complete drawing (plan is closed into a loop:
 after the last stroke the arm returns to the start pose, pen up).
 
+Re-timing ([drive].retime, 0..1): the camshaft turns at constant speed, so the
+cam profile's steepness is (follower speed) / (cam angle per second).  Instead
+of mapping time to cam angle uniformly, cam angle is handed out in proportion
+to how fast the followers move (with a floor for pauses, and enough angle for
+every pen lift).  Steep moments get more cam, idle moments less, so the
+steepest point is far less steep and the cams shrink.  retime = 0 reproduces
+the uniform mapping.
+
 Synthesis per axis: grid search over gear ratio, follower arm length and pitch
 radius, keeping max pressure angle <= alpha_max, groove curvature > roller
 radius, monotone polar angle (no self-intersection), and picking the
@@ -56,6 +64,10 @@ class DriveParams:
     pen_ramp: float = 0.25                       # s (set by plan_for_cams)
     cam_stack: tuple = tuple(_DR["cam_stack"])   # cams bottom -> top
     standoff_r: float = CFG["parts"]["standoff_od"] / 2
+    retime: float = _DR.get("retime", 0.0)       # 0 = uniform time -> cam angle, 1 = fully equalised
+    retime_floor: float = _DR.get("retime_floor", 0.25)   # min cam-angle rate, fraction of uniform
+    retime_accel_ratio: float = _DR.get("retime_accel_ratio", 20.0)  # curvature : slope**2 budget
+    max_contact: float = _DR.get("max_contact", 0.0)      # MPa groove Hertz limit (0 = not checked)
 
 
 # ------------------------------------------------------------ loop closing
@@ -65,26 +77,124 @@ def _minjerk(a, b, n):
     return a + (b - a) * s[:, None]
 
 
-def periodic_profiles(plan, p: DriveParams):
-    """-> theta (n,), motor angles (n,3) rad, pen (n,) in [0,1] (1 = down)."""
+def _closed_loop(plan, p):
+    """Plan + pen-up min-jerk return to the start pose, on the plan's time grid."""
     dt = plan.t[1] - plan.t[0]
     M = plan.motors
     nr = max(3, int(p.return_time / dt))
     ret = _minjerk(M[-1], M[0], nr + 2)[1:-1]
     Mall = np.vstack([M, ret])
     pen = np.r_[plan.pen.astype(float), np.zeros(len(ret))]
-    T = len(Mall) * dt
     t = np.arange(len(Mall)) * dt
-    tu = np.linspace(0, T, p.n, endpoint=False)
-    Mu = np.stack([np.interp(tu, t, Mall[:, k], period=T) for k in range(3)], 1)
-    # pen: cycloidal ramps of pen_ramp seconds (centered on each transition)
-    pen_u = np.interp(tu, t, pen, period=T)
-    w = max(1, int(round(p.pen_ramp / (T / p.n))))
+    return t, Mall, pen, len(Mall) * dt
+
+
+def _topp_rate(psi, du, V, A):
+    """Time-optimal path parameterisation: the largest path speed x = (du/dtheta)^2
+    along u such that every follower satisfies |dpsi/dtheta| <= V and
+    |d2psi/dtheta2| <= A.  psi: (N, k) periodic in u.  Returns du/dtheta (N,)."""
+    N = len(psi)
+    pu = (np.roll(psi, -1, 0) - np.roll(psi, 1, 0)) / (2 * du)
+    puu = (np.roll(psi, -1, 0) - 2 * psi + np.roll(psi, 1, 0)) / du ** 2
+    eps = 1e-12
+    x_cap = np.minimum((V / np.maximum(np.abs(pu), eps)) ** 2,
+                       A / np.maximum(np.abs(puu), eps)).min(1)              # max-velocity curve
+    x_cap = np.minimum(x_cap, 1e12)
+
+    def acc_bounds(k, x):
+        lo, hi = -np.inf, np.inf
+        for i in range(psi.shape[1]):
+            a_, b_ = pu[k, i], puu[k, i] * x
+            if abs(a_) < 1e-9:
+                continue
+            u1, u2 = (A - b_) / a_, (-A - b_) / a_
+            lo, hi = max(lo, min(u1, u2)), min(hi, max(u1, u2))
+        return lo, hi
+
+    # periodic: sweep three laps forward then backward, keep the middle lap
+    idx = np.r_[np.arange(N), np.arange(N), np.arange(N)]
+    x = x_cap[idx].copy()
+    for j in range(1, len(idx)):                                            # accelerate
+        lo, hi = acc_bounds(idx[j - 1], x[j - 1])
+        if np.isfinite(hi):
+            x[j] = min(x[j], max(x[j - 1] + 2 * du * hi, 0.0))
+    for j in range(len(idx) - 2, -1, -1):                                   # decelerate
+        lo, hi = acc_bounds(idx[j + 1], x[j + 1])
+        if np.isfinite(lo):
+            x[j] = min(x[j], max(x[j + 1] - 2 * du * lo, 0.0))
+    x = x[N:2 * N]
+    return np.sqrt(np.maximum(x, 1e-12))
+
+
+def retime_map(t, M, pen, p):
+    """Cam angle (0..2pi) reached at each time sample t.
+
+    The arm's path (the motor angles along plan time u) is kept; only the
+    speed along it changes.  A time-optimal parameterisation finds the cam
+    rate that keeps every follower's slope and curvature on the cam within a
+    fixed ratio (curvature, not slope, is what usually limits the groove), the
+    result is blended with the uniform mapping by p.retime, floored, and every
+    pen transition gets at least pen_ramp_deg of cam."""
+    from scipy.ndimage import gaussian_filter1d
+    dt = t[1] - t[0]
+    G = max(p.z_follow) / p.z_hub
+    sig = max(1.0, 0.03 / dt)
+    psi = gaussian_filter1d(M / G, sig, axis=0, mode="wrap")              # follower angles
+    V = 1.0
+    A = p.retime_accel_ratio * V
+    rate = _topp_rate(psi, dt, V, A)                                        # du / dtheta
+    dth_opt = 1.0 / rate                                                    # dtheta / du
+    dth_opt *= 2 * np.pi / (dth_opt.sum() * dt)
+    uni = 2 * np.pi / (len(t) * dt)
+    w = (1 - p.retime) * uni + p.retime * np.maximum(dth_opt, p.retime_floor * uni)
+    # pen transitions: guarantee pen_ramp_deg of cam around each one
+    edges = np.flatnonzero(np.diff(pen) != 0)
+    half = max(1, int(round(0.5 * p.pen_ramp / dt)))
+    need = math.radians(p.pen_ramp_deg)
+    for _ in range(8):
+        theta = 2 * np.pi * np.cumsum(w) / w.sum()
+        short = False
+        for e in edges:
+            lo, hi = max(0, e - half), min(len(w) - 1, e + half)
+            got = theta[hi] - theta[lo]
+            if got < need * 0.98:
+                w[lo:hi + 1] *= need / max(got, 1e-9) * 1.05
+                short = True
+        if not short:
+            break
+    w = gaussian_filter1d(w, sig, mode="wrap")
+    return 2 * np.pi * (np.cumsum(w) - w[0]) / w.sum()
+
+
+def cam_profiles(plan, p: DriveParams):
+    """-> theta (n,), motor angles (n,3) rad, pen (n,) in [0,1] (1 = down),
+    period T (s), and t_of_theta (n,): the time on the camshaft (uniform
+    rotation over T) at which the arm reaches each cam sample."""
+    t, Mall, pen, T = _closed_loop(plan, p)
+    theta_u = np.linspace(0, 2 * np.pi, p.n, endpoint=False)
+    if p.retime > 0:
+        th_t = retime_map(t, Mall, pen, p)
+        src = np.interp(theta_u, th_t, t)                    # plan time at each cam sample
+    else:
+        src = theta_u / (2 * np.pi) * T
+    Mu = np.stack([np.interp(src, t, Mall[:, k], period=T) for k in range(3)], 1)
+    pen_u = np.interp(src, t, pen, period=T)
+    # pen: cycloidal ramps (centred on each transition), width in cam samples
+    if p.retime > 0:
+        w = max(1, int(round(p.pen_ramp_deg / 360 * p.n)))
+    else:
+        w = max(1, int(round(p.pen_ramp / (T / p.n))))       # original behaviour
     ker = 1 - np.cos(np.linspace(0, 2 * np.pi, w + 2)[1:-1])
     ker /= ker.sum()
     pen_s = np.real(np.fft.ifft(np.fft.fft(pen_u) * np.fft.fft(np.r_[ker, np.zeros(p.n - len(ker))])))
     pen_s = np.roll(pen_s, -(len(ker) // 2))
-    return 2 * np.pi * tu / T, Mu, np.clip(pen_s, 0, 1), T
+    return theta_u, Mu, np.clip(pen_s, 0, 1), T, src
+
+
+def periodic_profiles(plan, p: DriveParams):
+    """-> theta (n,), motor angles (n,3) rad, pen (n,) in [0,1] (1 = down), T.
+    (kept for backward compatibility; see cam_profiles)"""
+    return cam_profiles(plan, p)[:4]
 
 
 # ---------------------------------------------------------- cam geometry
@@ -129,11 +239,23 @@ def _circle_x(c0, r0, c1, r1):
     return [m + h * perp, m - h * perp]
 
 
-def synth_axis(theta, rel, p, S, O, geared=True, name="", min_pivot=0.0, keepout=None):
+def groove_contact(ev, l, G, hub_torque, p):
+    """Peak Hertz pressure (MPa) of the roller on the groove wall for a hub
+    torque (N m, constant worst case): roller force = G*T / (l cos alpha)."""
+    E, nu = CFG["material"]["E"], CFG["material"]["nu"]
+    Es = 1 / ((1 - nu ** 2) / E + (1 - 0.3 ** 2) / 200e3)
+    Fr = G * hub_torque * 1000 / (l * np.cos(ev["alpha"]))
+    rho_wall = np.maximum(np.abs(ev["rho"]) - p.roller_r, 0.5)
+    R = 1 / (1 / p.roller_r + 1 / rho_wall)
+    return float(np.sqrt(Fr * Es / (math.pi * p.roller_w * R)).max())
+
+
+def synth_axis(theta, rel, p, S, O, geared=True, name="", min_pivot=0.0, keepout=None, hub_torque=0.0):
     """rel: (n,) desired OUTPUT angle relative to its mean (rad).
     min_pivot: the follower pivot (and its standoff) must be at least this far
     from the camshaft, i.e. clear of every cam lower in the stack.
     keepout(F) -> clearance (mm) of the pivot standoff to lower followers' swept areas.
+    hub_torque: design hub torque (N m) for the groove contact check (p.max_contact).
     Returns the best design dict or None."""
     best = None
     ratios = [(zf, zf / p.z_hub) for zf in p.z_follow] if geared else [(0, 1.0)]
@@ -166,6 +288,9 @@ def synth_axis(theta, rel, p, S, O, geared=True, name="", min_pivot=0.0, keepout
                         if keepout is not None and keepout(F) < 1.0:
                             continue
                         if geared and np.hypot(*(S - O)) < ev["outer"] + p.module * p.z_hub / 2 + 3:
+                            continue
+                        if p.max_contact and geared and hub_torque > 0 and \
+                                groove_contact(ev, l, G, hub_torque, p) > p.max_contact:
                             continue
                         score = ev["outer"] + 4 * G
                         if best is None or score < best["score"]:
@@ -212,14 +337,40 @@ class CamSet:
     O: np.ndarray
     axes: list = field(default_factory=list)       # M1, M2, M3 designs
     pen_axis: dict = None
+    plan_time: np.ndarray = None                   # plan time shown at each cam sample (re-timing)
+
+
+def cam_motion(cs: CamSet, g: Geometry):
+    """The motion the cams actually produce: camshaft at constant speed over
+    cs.period, sampled at every cam step.  Returns a planner.Plan (with
+    dynamics) so the structural check sees the re-timed accelerations."""
+    from .kinematics import Linkage
+    from .planner import dynamics
+    n = len(cs.theta)
+    dt = cs.period / n
+    t = np.arange(n) * dt
+    lk = Linkage(g)
+    xy = np.zeros((n, 2))
+    phi = np.zeros((n, 3))
+    for i, m in enumerate(cs.motors):
+        st = lk.solve(*m)
+        xy[i] = st["P"]
+        phi[i] = st["phi1"], st["phi2"], st["phi3"]
+    pen = cs.pen > 0.5
+    return dynamics(g, t, xy, pen, phi, np.ones(n, bool), dt)
 
 
 def design_cams(plan, g: Geometry, p: DriveParams = None):
     p = p or DriveParams()
-    theta, M, pen, T = periodic_profiles(plan, p)
+    theta, M, pen, T, plan_time = cam_profiles(plan, p)
     S = np.zeros(2)
     O = p.D_SO * np.array([math.cos(p.gamma_O), math.sin(p.gamma_O)])
     names = {"M1": (0, "M1 shoulder"), "M2": (1, "M2 elbow"), "M3": (2, "M3 wrist")}
+    # design load for the groove contact check: spring preload (worst end of travel)
+    # plus the largest torque the plan needs
+    pre = CFG["drive"].get("preload", {})
+    hub_pre = np.array(pre.get("hub_torque", [0, 0, 0]), float) * (1 + pre.get("torque_variation", 0))
+    design_torque = hub_pre + (np.abs(plan.tau).max(0) if hasattr(plan, "tau") else 0)
     axes = [None, None, None]
     pen_axis = None
     lower_outer = 0.0                            # largest cam below the current follower
@@ -234,19 +385,19 @@ def design_cams(plan, g: Geometry, p: DriveParams = None):
             k, name = names[key]
             rel = M[:, k] - M[:, k].mean()
             des = synth_axis(theta, rel, p, S, O, True, name, min_pivot=lower_outer,
-                             keepout=swept_keepout(lower, p))
+                             keepout=swept_keepout(lower, p), hub_torque=design_torque[k])
             if des is not None:
                 des["M_mean"] = float(M[:, k].mean())
             axes[k] = des
         if des is not None:
             lower_outer = max(lower_outer, des["outer"])
             lower.append(des)
-    return CamSet(p, theta, M, pen, T, O, axes, pen_axis)
+    return CamSet(p, theta, M, pen, T, O, axes, pen_axis, plan_time)
 
 
 def report(cs: CamSet):
     lines = [f"camshaft period {cs.period:.1f} s per drawing  (motor -> worm -> camshaft at "
-             f"{60 / cs.period:.2f} rpm)"]
+             f"{60 / cs.period:.2f} rpm), re-timing {cs.params.retime:g}"]
     for a in cs.axes + [cs.pen_axis]:
         if a is None:
             lines.append("  (axis infeasible: drawing too busy for one cam revolution)")

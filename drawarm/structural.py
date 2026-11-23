@@ -458,7 +458,7 @@ def fmt_joints(j):
 
 def run(src="heart"):
     from .shapes import drawing_name, load_drawing
-    from .cams import design_cams, plan_for_cams
+    from .cams import cam_motion, design_cams, plan_for_cams
     from .planner import plan_job
     from .inputs import fit_to_box
 
@@ -473,13 +473,14 @@ def run(src="heart"):
 
     plan_cam, dp = plan_for_cams(g, strokes)
     cs = design_cams(plan_cam, g, dp)
+    motion = cam_motion(cs, g)                     # what the camshaft really does (re-timed)
     springs = spr.design(paper_motor_range(g))
     err, ref = validate(g, plan_cam)
     md += [f"Validation: statics chain vs inverse dynamics, max motor-torque difference "
            f"{err:.1e} N·m (peak {ref:.1e} N·m).", "", spr.report(springs).split("\n", 2)[2], ""]
 
     plan_fast = plan_job(g, strokes, (380, 0))
-    cases = [("A – cam drive (as designed, spring-preloaded)", plan_cam, cs, springs),
+    cases = [(f"A – cam drive (as designed, re-timing {cs.params.retime:g}, spring-preloaded)", motion, cs, springs),
              ("B – fast motors (no cams, no springs; reference)", plan_fast, None, None)]
     for title, plan, cset, sp in cases:
         X, L = dynamic_case(g, plan)

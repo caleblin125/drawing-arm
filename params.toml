@@ -86,6 +86,10 @@ return_time = 1.2   # s pen-up return to the start pose
 pen_rise = 2.0      # pen-lift roller rise (mm)
 pen_ramp_deg = 8.0  # cam degrees per pen up/down ramp
 cam_stack = ["M2", "M1", "M3", "pen"]   # cams bottom -> top (must match parts.py LAYER)
+retime = 0.7        # re-timing: 0 = uniform time -> cam angle, 1 = fully cam-optimal speed
+retime_floor = 0.25 # minimum cam-angle rate (fraction of uniform), keeps pauses from vanishing
+retime_accel_ratio = 8.0   # curvature : slope^2 budget used by the re-timing
+max_contact = 40.0  # MPa: reject cam designs whose groove contact stress exceeds this (0 = off)
 
 [drive.roller]      # cam follower roller bearing
 name = "684ZZ"
