@@ -176,16 +176,18 @@ class Layout:
         p = self.p
         names = ["M1", "M2", "M3", "pen"]
         self.designs = [(nm, d) for nm, d in zip(names, cs.axes + [cs.pen_axis]) if d is not None]
+        self.drum = hasattr(cs, "drum")             # DrumSet: no cams above the base plate
         for nm, d in self.designs:
             O, R = cs.O, d["outer"]
-            self.items.append((LAYER["cam_" + nm], "cam " + nm, lambda q, O=O, R=R: np.hypot(*(q - O)) - R))
+            if not self.drum:
+                self.items.append((LAYER["cam_" + nm], "cam " + nm, lambda q, O=O, R=R: np.hypot(*(q - O)) - R))
             self.items.append((LAYER["follow_" + nm], "follower " + nm, self._follower_fn(nm, d)))
         # shoulder axle hardware
         r_tip = p.module * p.z_hub / 2 + p.module
         for lay in range(len(TH)):
             r = r_tip if lay in HUB_LAYERS else max(SPACER_R, DR["preload"].get("max_od", 21.0) / 2 + 1)
             self.items.append((lay, "shoulder hub/spacer", lambda q, r=r: np.hypot(*q) - r))
-            if lay not in CAM_LAYERS:
+            if lay not in CAM_LAYERS and not hasattr(cs, "drum"):
                 self.items.append((lay, "camshaft spacer", lambda q: np.hypot(*(q - cs.O)) - SPACER_R))
         # arm-side sweeps near the shoulder (cranks/couplers over the whole paper)
         from .kinematics import solve_ik
@@ -395,6 +397,8 @@ class Builder:
 
     # ---------------------------------------------------------- drive
     def build_drive(self):
+        if self.layout.drum:
+            return self.build_drum_drive()
         cs, p = self.cs, self.p
         O = cs.O
         rr = p.roller_r + PC["groove_clearance"] / 2
@@ -456,6 +460,75 @@ class Builder:
                 self.add(f"spacer_O_{i}", tube(O, SPACER_R, AXLE / 2, z0(lay) - za), -1, "#bbbbbb", z=za)
             za = z0(lay) + tk(lay)
 
+    def _follower_plate(self, nm, des, tf, with_arm=True):
+        """Follower body at its layer: pivot boss, (arm to roller), sector gear
+        toward the shoulder (geared axes) or cable lever (pen)."""
+        cs, p = self.cs, self.p
+        k = ["M1", "M2", "M3", "pen"].index(nm)
+        F = des["F"]
+        psi0 = des["psi"][0]
+        R0 = F + des["l"] * upol(psi0)
+        ra0, ra1 = PR["follower_arm"]
+        fol = slot_link(F, R0, ra0, ra1, tf) if with_arm else disc(F, ra0 + 2, tf)
+        if nm != "pen":
+            S = np.zeros(2)
+            a_mesh = ang(F, S)
+            lo, hi = self.M_paper[k]
+            lo, hi = min(lo, cs.motors[:, k].min()), max(hi, cs.motors[:, k].max())
+            dpsi = -(np.array([lo, hi]) - self.M0[k]) / des["G"]
+            span = abs(dpsi[1] - dpsi[0]) / 2 + math.radians(6)
+            centre = a_mesh - (dpsi.max() + dpsi.min()) / 2
+            rs = p.module * des["zf"] / 2
+            s0, s1 = PR["follower_spoke"]
+            fol = fol.union(slot_link(F, F + (rs - 3 * p.module - 2) * upol(centre), s0, s1, tf))
+            fol = fol.union(gear_sector(F, p.module, des["zf"], centre, span, tf, gap_on_center=True,
+                                        inner_r=rs - 3 * p.module - 2, anchor=a_mesh))
+        else:
+            tip = F - 45 * upol(psi0)                                     # cable lever
+            fol = holes(fol.union(slot_link(F, tip, ra0, 5, tf)), [tip], 2.0, tf)
+        return fol, F, R0
+
+    def _d_bore(self, solid, c, t):
+        """8 mm D-shaft bore (rocker shafts in drum mode)."""
+        flat = AXLE / 2 - 0.8
+        cut = disc(c, AXLE / 2, t).cut(cq.Workplane("XY").center(c[0] + flat + 5, c[1]).rect(10, 10).extrude(t))
+        return solid.cut(cut)
+
+    def build_drum_drive(self):
+        """Drum mode: follower plates (sector/lever only) on steel 8 mm D-shaft
+        rockers through the base plate; a finger + roller stud on each rocker in
+        the drum bay; the drum itself is exported separately as a mesh."""
+        cs, p, dp = self.cs, self.p, self.cs.drum
+        self.rockers = {}
+        for nm, des in self.layout.designs:
+            fl = LAYER["follow_" + nm]
+            tf = tk(fl)
+            fol, F, R0 = self._follower_plate(nm, des, tf, with_arm=False)
+            self.add(f"follower_{nm}", self._d_bore(fol, F, tf), fl, "#9e9e9e")
+            # finger in the bay: rocker -> roller stud (roller hangs below the finger)
+            zf = cs.z_contact[nm] + p.roller_w / 2 + dp.finger_gap
+            fin = slot_link(F, R0, 6.0, 5.0, dp.finger_t).union(disc(F, 8.0, dp.finger_t + 4))   # hub collar
+            fin = holes(self._d_bore(fin, F, dp.finger_t + 4), [R0], FIT_PIN, dp.finger_t)
+            self.add(f"finger_{nm}", fin, -1, "#9e9e9e", z=zf)
+            # spacer from the base top to the follower plate
+            self.add(f"standoff_{nm}", tube(F, STANDOFF_R, AXLE / 2, z0(fl) - GAP + GAP), -1, "#bcaaa4", z=-GAP)
+            self.rockers[nm] = dict(F=F, z_bottom=zf, z_top=z0(fl) + tf, length=z0(fl) + tf - zf + 5)
+
+    def bay_clearance(self):
+        """Drum bay: every rocker shaft that passes a finger's height must clear
+        that finger over its whole swing (fingers 6 mm half-width, shafts 4 mm)."""
+        out = []
+        des = dict(self.layout.designs)
+        for k, rk in self.rockers.items():
+            d = des[k]
+            idx = np.linspace(0, len(d["psi"]) - 1, 60).astype(int)
+            for j, rj in self.rockers.items():
+                if j == k or rj["z_bottom"] > rk["z_bottom"]:          # shaft j does not reach down here
+                    continue
+                c = min(seg_dist(rj["F"], d["F"], d["F"] + d["l"] * upol(d["psi"][i])) for i in idx) - 6 - 4.5
+                out.append((f"finger {k} vs rocker {j}", c))
+        return out
+
     def build_base(self):
         cs = self.cs
         pts = [np.zeros(2), cs.O] + [d["F"] for _, d in self.layout.designs]
@@ -465,7 +538,8 @@ class Builder:
         bt = PC["base_thickness"]
         base = cq.Workplane("XY").polyline([tuple(q) for q in h]).close().extrude(bt)
         base = holes(base, [np.zeros(2), cs.O], AXLE, bt)
-        base = holes(base, [d["F"] for _, d in self.layout.designs], PIN, bt)
+        pivot = AXLE if self.layout.drum else PIN                      # rocker shafts in drum mode
+        base = holes(base, [d["F"] for _, d in self.layout.designs], pivot, bt)
         self.parts["base_plate"] = (base.translate((0, 0, -bt - GAP)), -1, "#d7ccc8")
 
     def build(self):

@@ -166,6 +166,35 @@ def choose_pitch(z, band_w, options, fixed=0.0):
     return None
 
 
+def _seg_dist(q, a, b):
+    ab = b - a
+    t = np.clip(np.dot(q - a, ab) / max(np.dot(ab, ab), 1e-12), 0, 1)
+    return float(np.hypot(*(q - (a + t * ab))))
+
+
+def finger_order(designs, finger_r=6.0, shaft_r=4.5):
+    """Order of the fingers in the drum bay (top -> bottom) so that no rocker
+    shaft running down to a deeper finger crosses a shallower finger's swing.
+    designs: {name: design}.  Returns (order, min clearance)."""
+    import itertools
+    names = list(designs)
+    paths = {}
+    for nm, d in designs.items():
+        idx = np.linspace(0, len(d["psi"]) - 1, 60).astype(int)
+        paths[nm] = [(d["F"], d["F"] + d["l"] * np.array([math.cos(d["psi"][i]), math.sin(d["psi"][i])]))
+                     for i in idx]
+    best = None
+    for order in itertools.permutations(names):
+        worst = 1e9
+        for i, k in enumerate(order):                    # finger k at depth i
+            for j in order[i + 1:]:                       # shafts of deeper fingers pass it
+                Fj = designs[j]["F"]
+                worst = min(worst, min(_seg_dist(Fj, a, b) for a, b in paths[k]) - finger_r - shaft_r)
+        if best is None or worst > best[1]:
+            best = (list(order), worst)
+    return best
+
+
 # ----------------------------------------------------------------- design
 def design_drum(plan, g: Geometry, p: DriveParams = None, dp: DrumParams = None, passes=3):
     from dataclasses import replace
@@ -210,10 +239,14 @@ def design_drum(plan, g: Geometry, p: DriveParams = None, dp: DrumParams = None,
     band_w = slot_width(p, dp)
     if dp.contact == "below_base":
         # drum bay under the base plate: rollers evenly stacked, one band slot apart
-        top = -CFG["parts"]["gap"] - CFG["parts"]["base_thickness"] - 3.0
-        z = {nm: top - (i + 0.5) * band_w - p.roller_w / 2 for i, nm in enumerate(p.cam_stack[::-1])}
-        need = band_w * len(z)
+        need = band_w * len(p.cam_stack)
         pitch = dp.pitch or min([o for o in dp.pitch_options if o >= need] or [need])
+        # the drum rises `turns * pitch` while drawing: keep its top below the base plate
+        top = -CFG["parts"]["gap"] - CFG["parts"]["base_thickness"] - 3.0 - dp.turns * pitch - dp.end_margin
+        named = {nm: d for nm, d in zip(("M1", "M2", "M3", "pen"), axes + [pen_axis]) if d is not None}
+        order, _ = finger_order(named) if named else (list(p.cam_stack[::-1]), 0)
+        order += [nm for nm in p.cam_stack if nm not in order]
+        z = {nm: top - (i + 0.5) * band_w for i, nm in enumerate(order)}
     else:
         pitch, z = place_bands(contact_ranges(p, dp), band_w, dp.pitch_options, dp.pitch)
     found = [d for d in axes + [pen_axis] if d is not None]
@@ -233,7 +266,7 @@ def report(ds: DrumSet):
              f"({60 * ds.drum.turns / ds.period:.1f} rpm), re-timing {ds.params.retime:g}",
              (f"  lead {ds.pitch:g} mm/turn (travel {ds.drum.turns * ds.pitch:.0f} mm), "
               f"surface radius {ds.R_core:.0f}-{ds.R_outer:.0f} mm (OD {2 * ds.R_outer:.0f}), "
-              f"length {ds.length:.0f} mm") if ds.pitch else
+              f"length {ds.length:.0f} mm, drum bay {-ds.z_bottom:.0f} mm deep below the arm") if ds.pitch else
              "  NO lead fits: followers too close in height for the band width (raise pitch_options)"]
     for a in ds.axes + [ds.pen_axis]:
         if a is None:

@@ -17,6 +17,7 @@ def main(argv=None):
     pd = sub.add_parser("drum", help="multi-turn cam drum: report, output/drum.stl, output/drum_<name>.png")
     pd.add_argument("drawing", nargs="?", default="heart")
     pd.add_argument("--turns", type=int, default=None, help="drum turns per drawing (default: params.toml)")
+    pd.add_argument("--parts", action="store_true", help="also build the drum-mode printable parts")
     for name, text in (("cams", "design the cam stack for a drawing (+ output/cams_<name>.png)"),
                        ("parts", "generate printable parts: STL, STEP, preview, spring spec"),
                        ("strain", "structural report: stress, strain, pen error")):
@@ -75,6 +76,24 @@ def main(argv=None):
             plot_drum(ds, out_path(f"drum_{drawing_name(a.drawing)}.png"))
             write_stl(drum_triangles(ds), out_path("drum.stl"))
             print(f"-> {out_path('drum.stl')}, {out_path(f'drum_{drawing_name(a.drawing)}.png')}")
+            if a.parts:
+                from . import springs as spr
+                from .parts import Builder, export, preview, drive_clearance
+                b = Builder(g, ds)
+                parts = b.build()
+                for what, who, lay, c in drive_clearance(b.layout):
+                    print(f"  {what:24s} {c:6.1f} mm  (nearest: {who} L{lay})" + ("   <-- COLLISION" if c < 0 else ""))
+                for what, c in b.bay_clearance():
+                    print(f"  {what:24s} {c:6.1f} mm" + ("   <-- COLLISION" if c < 0 else ""))
+                for nm, r in b.rockers.items():
+                    print(f"  rocker shaft {nm:4s}: 8 mm D-shaft, {r['length']:.0f} mm long")
+                outdir = out_path("drum_parts", "x")[:-2]
+                export(parts, outdir)
+                write_stl(drum_triangles(ds), out_path("drum_parts", "stl", "drum.stl"))
+                preview(parts, out_path("drum_parts", "preview.png"))
+                with open(out_path("drum_parts", "springs.md"), "w", encoding="utf-8") as f:
+                    f.write(spr.report(b.springs))
+                print(f"{len(parts) + 1} parts -> {outdir}")
     elif a.cmd == "strain":
         from .structural import run
         print(run(a.drawing))
