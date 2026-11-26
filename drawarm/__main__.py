@@ -23,6 +23,12 @@ def main(argv=None):
     pc_.add_argument("--no-stl", action="store_true", help="report only")
     pm = sub.add_parser("machine", help="complete single-motor automaton with swappable cams (output/machine/<name>)")
     pm.add_argument("drawing", nargs="?", default="heart")
+    pp_ = sub.add_parser("physics", help="physics test: prepare / run / summarize (Monte-Carlo tolerances)")
+    pp_.add_argument("action", choices=["prepare", "run", "summarize"])
+    pp_.add_argument("target", nargs="?", default="heart", help="drawing (prepare), scenario.pkl (run), results dir")
+    pp_.add_argument("-o", "--out", default=None)
+    pp_.add_argument("--first", type=int, default=0)
+    pp_.add_argument("--count", type=int, default=1)
     for name, text in (("cams", "design the cam stack for a drawing (+ output/cams_<name>.png)"),
                        ("parts", "generate printable parts: STL, STEP, preview, spring spec"),
                        ("strain", "structural report: stress, strain, pen error")):
@@ -160,6 +166,20 @@ def main(argv=None):
             f.write(m.bom())
         print(m.bom())
         print(f"{len(parts)} parts -> {out_path('machine', name)}" + ("  (fix collisions first!)" if bad else ""))
+    elif a.cmd == "physics":
+        import pickle
+        from . import physics as ph
+        from .config import out_path
+        if a.action == "prepare":
+            sc = ph.prepare(a.target)
+            path = a.out or out_path("physics", f"scenario_{a.target}.pkl")
+            with open(path, "wb") as f:
+                pickle.dump(sc, f)
+            print(f"scenario -> {path}" + (f"  (cam problems: {sc['problems']})" if sc["problems"] else ""))
+        elif a.action == "run":
+            ph.run_batch(a.target, a.first, a.count, a.out or out_path("physics", "results", "x")[:-2])
+        else:
+            print(ph.summarize(a.target, a.out))
     elif a.cmd == "strain":
         from .structural import run
         print(run(a.drawing))

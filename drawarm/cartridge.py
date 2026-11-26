@@ -47,6 +47,8 @@ class CartridgeParams:
     slide_clear: float = _CP.get("slide_clear", 2.0)      # roller <-> cam while sliding out (mm)
     pen_lift: float = _CP.get("pen_lift", 3.0)            # pen travel at the hand (mm)
     pen_rise: float = _CP.get("pen_rise", 3.0)            # pen-lift roller rise on the cam (mm)
+    compensate: bool = _CP.get("compensate", True)        # pre-distort cams for predicted deflection
+    compensate_smooth_deg: float = _CP.get("compensate_smooth_deg", 6.0)   # smoothing of the correction
 
 
 @dataclass
@@ -197,6 +199,40 @@ def design_followers(g: Geometry, p: DriveParams = None, cp: CartridgeParams = N
 
 
 # -------------------------------------------------------------- cam stack
+def compliance_offsets(cs, g, fol):
+    """Predicted follower-angle correction (per axis, on the cam grid) that
+    cancels the static deflection of the drive: gear-tooth/spoke compliance,
+    the backlash flank the springs hold, and roller-contact + follower-arm
+    compliance (x3 through the gear).  Loads = re-timed dynamics + pen drag -
+    spring preload, i.e. what the gear mesh must actually carry."""
+    from .cams import cam_motion
+    from .structural import dynamic_case
+    from . import springs as spr
+    ph = CFG.get("physics", {})
+    k_g = ph.get("k_mesh", 300.0)                                   # N m/rad at the hub
+    k_c = ph.get("k_contact", 2.0e4)                                # N/m at the roller
+    r_hub = fol.params.module * fol.params.z_hub / 2 / 1000
+    b2 = CFG["parts"]["backlash"] * 2 / 1000 / r_hub / 2            # half the hub backlash (rad)
+    motion = cam_motion(cs, g)
+    X, L = dynamic_case(g, motion)
+    M = np.unwrap(X["phi"], axis=0) + np.array([0.0, math.pi, g.off_a])
+    sp = spr.design(paper_motor_range(g), fol.spring_sign)
+    out = {}
+    for k, nm in enumerate(("M1", "M2", "M3")):
+        ax = fol.axes[nm]
+        tau_g = L["tau"][:, k] - spr.hub_spring_torque(sp[nm], M[:, k])      # gear torque on the hub
+        f = -tau_g / k_g                                              # mesh spring stretch
+        delta = f + np.sign(f) * b2                                   # + backlash flank
+        gap = np.abs(ax["G"] * tau_g) / (k_c * (ax["l"] / 1000) ** 2)  # roller sinks into the cam
+        off = delta / ax["G"] - ax["inward"] * gap
+        # the loads come from finite-differenced accelerations: smooth over a few
+        # degrees of cam so the correction does not add sharp features to the rim
+        from scipy.ndimage import gaussian_filter1d
+        sig = max(1.0, fol.cart.compensate_smooth_deg / 360 * len(off))
+        out[nm] = gaussian_filter1d(off, sig, mode="wrap")
+    return out
+
+
 def cams_for(plan, g: Geometry, fol: Followers, tune=True):
     """Cam stack for a drawing on the fixed followers.  Returns a CamSet (so
     parts/structural keep working) plus a list of problems (empty = OK).
@@ -208,6 +244,8 @@ def cams_for(plan, g: Geometry, fol: Followers, tune=True):
     for rt, ar in variants:
         q = fol.params if rt is None else replace(fol.params, retime=rt, retime_accel_ratio=ar)
         cs, probs, worst = _cams_for(plan, g, fol, q)
+        if fol.cart.compensate:                                       # second pass with deflection offsets
+            cs, probs, worst = _cams_for(plan, g, fol, q, compliance_offsets(cs, g, fol))
         if best is None or worst < best[2]:
             best = (cs, probs, worst)
         if not probs:
@@ -215,7 +253,7 @@ def cams_for(plan, g: Geometry, fol: Followers, tune=True):
     return best[0], best[1]
 
 
-def _cams_for(plan, g, fol, p):
+def _cams_for(plan, g, fol, p, offsets=None):
     worst = 0.0
     th, M, pen, T, plan_time = cam_profiles(plan, p)
     pre = CFG["drive"].get("preload", {})
@@ -224,6 +262,8 @@ def _cams_for(plan, g, fol, p):
     for key, ax in fol.axes.items():
         k = NAMES.index(key)
         psi = follower_psi(ax, M=M[:, k]) if ax["zf"] else follower_psi(ax, pen=pen)
+        if offsets and key in offsets:
+            psi = psi + offsets[key]
         ev = periphery_eval(th, fol.O, ax["F"], ax["l"], psi, p)
         des = dict(name=key, F=ax["F"], l=ax["l"], G=ax["G"], zf=ax["zf"], Rp=ax["Rp"], a=ax["a"], psi=psi,
                    score=0, **ev)

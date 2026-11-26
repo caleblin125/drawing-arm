@@ -130,6 +130,29 @@ pen_spring_force = 1.0   # N pen pressure
 guide_d = 16.0      # pen carrier guide bore in the hand
 top_gap = 3.0       # carriage top plate above the top layer
 
+# ------------------------------------------------------------ physics test
+[physics]           # python -m drawarm physics ...; every key optional
+dt = 2e-4           # s integration step
+revolutions = 2.0   # start from rest, score the last revolution
+k_mesh = 300.0      # N m/rad gear mesh at the hub (printed teeth + spokes)
+k_contact = 2.0e4   # N/m roller contact incl. follower-arm bending
+k_worm = 150.0      # N m/rad worm mesh at the camshaft
+eta_worm = 0.4      # worm efficiency (< 0.5 = self-locking)
+J_cam = 2.0e-3      # kg m^2 camshaft + cams + wheel
+stall = 0.08        # N m gearmotor stall torque
+no_load_rpm = 230.0 # gearmotor no-load speed
+pen_mu = 0.4
+pen_normal = 1.0
+# Monte-Carlo tolerance ranges
+tol_link_mm = 0.15
+tol_cam_mm = 0.10
+tol_backlash_mm = [0.03, 0.20]
+tol_preload = 0.20
+tol_stiffness = 0.30
+tol_pen_mu = [0.2, 0.6]
+tol_voltage = 0.10
+tol_stall = 0.15
+
 # ---------------------------------------------------------- cam drum
 [drum]              # multi-turn drum (python -m drawarm drum ...); every key optional
 turns = 4           # drum revolutions per drawing
