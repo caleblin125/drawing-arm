@@ -103,6 +103,15 @@ sign = [1, 1, 1]                  # +1 = CCW on the hub
 torque_variation = 0.25           # allowed +- torque change over the hub travel (whole paper)
 max_od = 21.0                     # spring OD limit (hub boss is 20 mm)
 
+# ------------------------------------------------- swappable cam cartridge
+[cartridge]         # fixed followers + replaceable cam stacks (python -m drawarm cartridge ...)
+reference = ["circle", "heart", "star", "spiral"]   # drawings the fixed followers are sized for
+max_od = 220.0      # largest cam (print bed / carriage envelope)
+contact_cone = 75.0 # deg: contact points must face the followers (opposite the slide-out)
+stop_margin = 4.0   # deg: follower stops just beyond the paper travel
+slide_clear = 2.0   # mm: roller <-> cam once separated during slide-out
+pen_lift = 4.0      # mm pen travel at the hand
+
 # ---------------------------------------------------------- cam drum
 [drum]              # multi-turn drum (python -m drawarm drum ...); every key optional
 turns = 4           # drum revolutions per drawing

@@ -18,6 +18,9 @@ def main(argv=None):
     pd.add_argument("drawing", nargs="?", default="heart")
     pd.add_argument("--turns", type=int, default=None, help="drum turns per drawing (default: params.toml)")
     pd.add_argument("--parts", action="store_true", help="also build the drum-mode printable parts")
+    pc_ = sub.add_parser("cartridge", help="fixed followers + swappable cam stacks (output/cartridge/<name>/*.stl)")
+    pc_.add_argument("drawings", nargs="*", default=["heart"])
+    pc_.add_argument("--no-stl", action="store_true", help="report only")
     for name, text in (("cams", "design the cam stack for a drawing (+ output/cams_<name>.png)"),
                        ("parts", "generate printable parts: STL, STEP, preview, spring spec"),
                        ("strain", "structural report: stress, strain, pen error")):
@@ -94,6 +97,31 @@ def main(argv=None):
                 with open(out_path("drum_parts", "springs.md"), "w", encoding="utf-8") as f:
                     f.write(spr.report(b.springs))
                 print(f"{len(parts) + 1} parts -> {outdir}")
+    elif a.cmd == "cartridge":
+        import cadquery as cq
+        from .cams import plan_for_cams
+        from .cartridge import (cam_solids, cams_for, design_followers, plot_cartridge, report,
+                                slide_out_check)
+        from .config import PAPER, out_path
+        from .inputs import fit_to_box
+        from .kinematics import Geometry
+        from .shapes import drawing_name, load_drawing
+        g = Geometry()
+        fol = design_followers(g)
+        res = []
+        for src in a.drawings:
+            plan, _ = plan_for_cams(g, fit_to_box(load_drawing(src), PAPER))
+            cs, probs = cams_for(plan, g, fol)
+            clear, s_free = slide_out_check(cs, fol)
+            res.append((drawing_name(src), cs, probs, clear))
+            name = drawing_name(src)
+            plot_cartridge(cs, fol, out_path("cartridge", name, "layout.png"), f"cam cartridge: {name}")
+            if not a.no_stl:
+                for nm, solid in cam_solids(cs, fol).items():
+                    cq.exporters.export(solid, out_path("cartridge", name, f"cam_{nm}.stl"),
+                                        tolerance=0.05, angularTolerance=0.1)
+        print(report(fol, res))
+        print(f"-> {out_path('cartridge')}")
     elif a.cmd == "strain":
         from .structural import run
         print(run(a.drawing))
