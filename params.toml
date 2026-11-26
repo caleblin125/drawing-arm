@@ -110,7 +110,25 @@ max_od = 220.0      # largest cam (print bed / carriage envelope)
 contact_cone = 75.0 # deg: contact points must face the followers (opposite the slide-out)
 stop_margin = 4.0   # deg: follower stops just beyond the paper travel
 slide_clear = 2.0   # mm: roller <-> cam once separated during slide-out
-pen_lift = 4.0      # mm pen travel at the hand
+pen_lift = 3.0      # mm pen travel at the hand
+pen_rise = 3.0      # mm pen-lift roller rise on the cam (lever ratio = pen_lift / pen_rise)
+
+# ------------------------------------------------ complete machine (one motor)
+[machine]           # python -m drawarm machine <drawing>; every key optional
+motor_rpm = 200.0   # N20-style gearmotor output speed (trim with voltage)
+motor_body = [12.0, 10.0, 24.0]   # gearmotor body w, h, length (mm)
+motor_shaft_d = 3.0
+worm_module = 1.5
+worm_r = 6.0        # worm pitch radius
+worm_len = 16.0
+wheel_teeth = 30    # single-start worm: reduction = wheel_teeth
+wheel_t = 8.0
+channel_w = 30.0    # carriage tongue width (slides in the base-plate channel)
+tongue_clear = 0.3
+stop_r = 4.0        # follower stop post radius
+pen_spring_force = 1.0   # N pen pressure
+guide_d = 16.0      # pen carrier guide bore in the hand
+top_gap = 3.0       # carriage top plate above the top layer
 
 # ---------------------------------------------------------- cam drum
 [drum]              # multi-turn drum (python -m drawarm drum ...); every key optional

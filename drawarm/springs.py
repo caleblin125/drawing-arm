@@ -34,8 +34,10 @@ def gap_lengths():
             "M3": z0(LAYER["gear_M3"]) - (z0(LAYER["upper_arm"]) + th[LAYER["upper_arm"]])}
 
 
-def design(motor_ranges):
+def design(motor_ranges, signs=None):
     """motor_ranges: [(lo, hi)] rad for M1, M2, M3 (whole paper).
+    signs: optional per-hub spring directions overriding [drive.preload].sign
+    (the cam cartridge needs specific directions).
     Returns dict per axis with the spring spec and its torque law."""
     pre = CFG["drive"]["preload"]
     axle = CFG["drive"]["shaft_d"]
@@ -43,7 +45,7 @@ def design(motor_ranges):
     out = {}
     for k, nm in enumerate(("M1", "M2", "M3")):
         P = pre["hub_torque"][k] * 1000                # N mm
-        sign = pre["sign"][k]
+        sign = (signs or pre["sign"])[k]
         lo, hi = motor_ranges[k]
         travel = hi - lo
         L_avail = gaps[nm] - 0.5

@@ -45,7 +45,8 @@ class CartridgeParams:
     contact_cone: float = math.radians(_CP.get("contact_cone", 75.0))   # contact points vs. -slide
     stop_margin: float = math.radians(_CP.get("stop_margin", 4.0))      # follower stop beyond travel
     slide_clear: float = _CP.get("slide_clear", 2.0)      # roller <-> cam while sliding out (mm)
-    pen_lift: float = _CP.get("pen_lift", 4.0)            # pen travel at the hand (mm)
+    pen_lift: float = _CP.get("pen_lift", 3.0)            # pen travel at the hand (mm)
+    pen_rise: float = _CP.get("pen_rise", 3.0)            # pen-lift roller rise on the cam (mm)
 
 
 @dataclass
@@ -95,8 +96,8 @@ def design_followers(g: Geometry, p: DriveParams = None, cp: CartridgeParams = N
     drawing (and stays inside the carriage envelope over the whole paper)."""
     from .inputs import fit_to_box
     from .shapes import load_drawing
-    p = p or DriveParams()
     cp = cp or CartridgeParams()
+    p = replace(p or DriveParams(), pen_rise=cp.pen_rise)
     S = np.zeros(2)
     O = p.D_SO * np.array([math.cos(p.gamma_O), math.sin(p.gamma_O)])
     slide = O / np.linalg.norm(O)                                # away from the shoulder

@@ -254,7 +254,7 @@ def drive_clearance(layout):
 
 # ================================================================== parts
 class Builder:
-    def __init__(self, g: Geometry, cs):
+    def __init__(self, g: Geometry, cs, spring_sign=None):
         self.g, self.cs = g, cs
         self.p = cs.params
         M0 = cs.motors[0]                          # assembled pose = cam angle 0
@@ -262,7 +262,7 @@ class Builder:
         self.st = Linkage(g).solve(*M0)
         self.M0 = M0
         self.layout = Layout(g, cs, self.M_paper)
-        self.springs = spr.design(self.M_paper)        # torsion springs on the shoulder axle
+        self.springs = spr.design(self.M_paper, spring_sign)   # torsion springs on the shoulder axle
         self.parts = {}                            # name -> (solid in world, layer, colour)
 
     def add(self, name, solid, layer, color, z=None):

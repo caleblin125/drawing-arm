@@ -21,6 +21,8 @@ def main(argv=None):
     pc_ = sub.add_parser("cartridge", help="fixed followers + swappable cam stacks (output/cartridge/<name>/*.stl)")
     pc_.add_argument("drawings", nargs="*", default=["heart"])
     pc_.add_argument("--no-stl", action="store_true", help="report only")
+    pm = sub.add_parser("machine", help="complete single-motor automaton with swappable cams (output/machine/<name>)")
+    pm.add_argument("drawing", nargs="?", default="heart")
     for name, text in (("cams", "design the cam stack for a drawing (+ output/cams_<name>.png)"),
                        ("parts", "generate printable parts: STL, STEP, preview, spring spec"),
                        ("strain", "structural report: stress, strain, pen error")):
@@ -122,6 +124,42 @@ def main(argv=None):
                                         tolerance=0.05, angularTolerance=0.1)
         print(report(fol, res))
         print(f"-> {out_path('cartridge')}")
+    elif a.cmd == "machine":
+        import cadquery as cq
+        from .cams import plan_for_cams
+        from .cartridge import cams_for, design_followers
+        from .config import PAPER, out_path
+        from .inputs import fit_to_box
+        from .kinematics import Geometry
+        from .machine import Machine
+        from .parts import preview
+        from .shapes import drawing_name, load_drawing
+        g = Geometry()
+        fol = design_followers(g)
+        plan, _ = plan_for_cams(g, fit_to_box(load_drawing(a.drawing), PAPER))
+        cs, probs = cams_for(plan, g, fol)
+        if probs:
+            print("cam stack problems: " + "; ".join(probs))
+        m = Machine(g, plan, fol, cs)
+        parts = m.build()
+        bad = False
+        for what, c in m.checks():
+            print(f"  {what:48s} {c:7.1f} mm" + ("   <-- COLLISION" if c < 0 else ""))
+            bad |= c < 0
+        name = drawing_name(a.drawing)
+        asm = cq.Assembly(name="drawing_automaton")
+        for k, (solid, lay, col) in parts.items():
+            asm.add(solid, name=k, color=cq.Color(col))
+            sub_ = "cams" if k in m.cam_names else "fixed"
+            bb = solid.val().BoundingBox()
+            cq.exporters.export(solid.translate((-bb.center.x, -bb.center.y, -bb.zmin)),
+                                out_path("machine", name, sub_, f"{k}.stl"), tolerance=0.05, angularTolerance=0.1)
+        asm.export(out_path("machine", name, "assembly.step"))
+        preview(parts, out_path("machine", name, "preview.png"))
+        with open(out_path("machine", name, "BOM.md"), "w", encoding="utf-8") as f:
+            f.write(m.bom())
+        print(m.bom())
+        print(f"{len(parts)} parts -> {out_path('machine', name)}" + ("  (fix collisions first!)" if bad else ""))
     elif a.cmd == "strain":
         from .structural import run
         print(run(a.drawing))
