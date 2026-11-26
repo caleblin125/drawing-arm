@@ -110,6 +110,60 @@ long rocker shafts, a custom 36 mm-lead screw, and the drum STL is a mesh
 
 ![drum mesh](images/drum_3d.png)
 
+## Swappable cam cartridge (`drawarm/cartridge.py`, `drawarm/machine.py`)
+
+![cartridge](images/cartridge_heart.png)
+
+* **Fixed followers.** In plain cam mode every drawing re-optimises the
+  follower pivots. Here one follower set is designed for a *reference class*
+  of drawings (`[cartridge].reference`, default circle / heart / star /
+  spiral) and the whole paper, inside a 220 mm cam envelope; each new drawing
+  only needs a new cam stack. Drawings busier than the class are reported
+  (e.g. lissajous) → use the drum or simplify.
+* **Periphery cams.** Rollers ride on the cam rims, pressed on by the shoulder
+  torsion springs; the spring direction for each hub is chosen so the roller
+  is pushed toward the camshaft. Every contact point faces the followers.
+* **Slide-out carriage.** Camshaft, cams, worm wheel and the motor ride on a
+  carriage (tongue in a base-plate channel, two posts, top plate, latch pin).
+  Sliding it away from the followers lets every roller follow its cam a few
+  degrees to a **stop post** (acting on a tail of the follower, outside the cam
+  envelope), after which the cams slide clear (checked: ≥ 2 mm).
+* **Pen lift.** A lever on the pen follower pulls a Bowden cable to a
+  spring-loaded pen carrier in the hand (spring = pen pressure, cable = lift);
+  the cable tension also keeps the pen roller on its cam.
+* **One motor.** N20-style gearmotor → printed single-start worm (module 1.5)
+  → 30-tooth helical worm wheel on the camshaft (self-locking).
+* **Deflection compensation.** The physics test showed the follower arms and
+  gear teeth deflect under the constant spring preload (×3 through the gear),
+  ~1 cm at the pen. The cams are pre-distorted for the predicted gear,
+  backlash-flank and contact deflection (smoothed over 6° of cam):
+  nominal pen error 10.8 → 0.7 mm RMS.
+
+| drawing | cams OD (M1 / M2 / M3 / pen) | status |
+|---|---|---|
+| circle / heart / star / spiral | ≈ 193–204 / 157–162 / 127–133 / 161 mm | OK |
+| flower | ≈ 203 / 159 / 131 / 161 mm | marginal (rim contact 41 MPa) |
+| lissajous | – | beyond the class → drum |
+
+## Physics test (`drawarm/physics.py`, `hpc/`)
+
+Time-domain model: DC gearmotor (torque–speed line), self-locking worm with
+compliance, camshaft inertia, one-sided compliant roller contacts (lift-off
+detected), gear meshes with backlash, hub preload springs, 3-link arm
+dynamics in absolute coordinates, pen drag. Followers are quasi-static
+(solved exactly each step). Monte-Carlo draws: link lengths ±0.15 mm, cam
+print error 0.1 mm, backlash 0.03–0.2 mm, preload ±20 %, stiffness ±30 %,
+pen μ 0.2–0.6, motor voltage ±10 %, stall torque ±15 %.
+
+| heart | pen error RMS / max | roller lift-off | gear reversals | motor load |
+|---|---|---|---|---|
+| nominal | 0.73 / 2.4 mm | none | none | 31 % of stall |
+| 3 tolerance draws (local) | 1.5–2.4 / 3.1–4.7 mm | none | none | 27–35 % |
+
+A 400-run Monte-Carlo runs on the cluster (`hpc/physics_array.sbatch`);
+`python -m drawarm physics summarize <results>` ranks which tolerance drives
+the pen error.
+
 ## Structural check (`drawarm/structural.py`, heart, PLA)
 
 Full report: [reports/strain_heart.md](reports/strain_heart.md).

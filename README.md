@@ -17,6 +17,9 @@ python -m drawarm test            # numerical self-checks
 python -m drawarm cams heart      # encode a drawing onto cams
 python -m drawarm parts heart     # printable parts -> output/stl, output/assembly.step
 python -m drawarm drum heart --parts   # multi-turn drum instead of cams (+ its parts)
+python -m drawarm cartridge heart star # swappable cam stacks for FIXED followers
+python -m drawarm machine heart   # the complete single-motor automaton: fixed parts + cam set + BOM
+python -m drawarm physics prepare heart && python -m drawarm physics run output/physics/scenario_heart.pkl
 python -m drawarm strain heart    # stress / strain / pen-error report
 ```
 
@@ -40,6 +43,9 @@ drawarm/             the Python package
   shapes.py          built-in drawings, load_drawing()
   cams.py            one-motor cam stack synthesis (+ re-timing)
   drum.py            multi-turn cam drum
+  cartridge.py       fixed followers + swappable periphery cam stacks, deflection compensation
+  machine.py         complete automaton: carriage, motor + worm, pen lift, stops, BOM
+  physics.py         time-domain physics test with Monte-Carlo tolerances
   springs.py         anti-backlash torsion springs
   parts.py           CadQuery parts, STL/STEP export, clearance checks
   structural.py      loads, stress, strain, pen-tip error
@@ -51,8 +57,32 @@ docs/
   reports/           example spring spec and structural report (heart)
   images/            figures used in the docs
 examples/sample.svg  test drawing
+hpc/                 Slurm scripts for running the physics Monte-Carlo on a cluster
 output/              generated files (git-ignored)
 ```
+
+## The complete machine
+
+`python -m drawarm machine heart` builds everything for one drawing:
+`output/machine/heart/fixed/*.stl` (print once), `cams/*.stl` (the swappable
+cam set), `assembly.step` and a [bill of materials](docs/reports/BOM_heart.md).
+**One N20 gearmotor** drives a printed worm and worm wheel on the camshaft;
+every other motion (shoulder, elbow, wrist and pen lift) comes from the cams.
+
+![machine](docs/images/machine_heart.png)
+
+**Swapping drawings:** the followers are fixed (designed once for a class of
+drawings) and only the cam stack changes. Pull the latch pin, slide the cam
+carriage out (the rollers park on their stops), lift the cams off the D-shaft,
+drop the new set on, index, slide back, latch.
+
+**Physics test:** a time-domain model of the whole machine (motor, worm,
+cams, compliant contacts, backlash, springs, arm dynamics, pen drag) with
+Monte-Carlo manufacturing tolerances; it runs locally or as a Slurm array
+(see [hpc/README.md](hpc/README.md)). It showed that follower-arm and gear
+compliance under the spring preload would cost ~1 cm at the pen, so the cams
+are now pre-distorted for the predicted deflection: nominal pen error 0.7 mm
+RMS, no roller lift-off, no gear load reversals, motor at ~31 % of stall.
 
 ## Mechanism
 
